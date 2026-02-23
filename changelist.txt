@@ -1,0 +1,249 @@
+CHANGELIST — AML Transaction Risk Engine
+=========================================
+Date: 2026-02-23
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMIT 3: Quantize & scale models for 10Mx dataset growth
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files changed: ml/model.py, ml/train.py, requirements.txt
+
+XGBoost (ml/model.py — AMLModel):
+  - Added tree_method="hist" and max_bin=256 to XGBClassifier.
+    Bins all 44 features into 256 discrete buckets before split-finding.
+    Reduces complexity from O(n·f) to O(256·f), giving 5–10x faster
+    training at large scale with negligible accuracy loss.
+  - Added export_onnx_quantized() method: exports trained weights to
+    INT8 via ONNX Runtime dynamic quantization (~4x smaller model,
+    ~2–3x faster inference). Falls back gracefully if onnx packages
+    are not installed.
+
+SVM (ml/model.py — SVMModel) — fully replaced:
+  - Replaced SVC(kernel="rbf") with SGDClassifier(loss="modified_huber").
+    A linear SVM surrogate that trains in O(n) and infers in O(d) via
+    a single dot-product. The original RBF-SVC scales O(n²) in training
+    and O(n·sv) in inference — infeasible at 10M+ rows.
+  - elasticnet regularisation (L1+L2), class_weight="balanced" preserved.
+  - Added export_onnx_quantized() for INT8 ONNX inference.
+
+KNN (ml/model.py — KNNModel) — FAISS IVF-PQ with smart fallback:
+  - For < 500K rows (current dataset):
+      sklearn KNeighborsClassifier + ball_tree (fastest for small data;
+      avoids FAISS k-means thread-initialisation overhead).
+  - For 500K – 500M rows:
+      faiss.IndexFlatL2 (exact L2 search, no codebook k-means).
+  - For >= 500M rows:
+      faiss.IndexIVFPQ — partitions space into adaptive n_cells Voronoi
+      cells + 8-bit product quantization (~22x index compression vs raw
+      float32). n_cells = sqrt(n_train), clamped to [64, 4096].
+  - All three paths expose the same predict_proba_single() interface.
+  - Inference: distance-weighted fraud probability (1/d weights) via
+    FAISS search, replicating sklearn's weights="distance" behaviour.
+
+Training pipeline (ml/train.py):
+  - Replaced list(session.run(...)) — which loads the full dataset into
+    RAM — with paginated SKIP/LIMIT Neo4j reads in pages of PAGE_SIZE=
+    10,000 rows. Memory stays bounded regardless of total row count.
+  - Added COUNT_QUERY to determine total rows before paging.
+  - Added PAGE_QUERY with $skip/$limit parameters for pagination.
+  - Added _try_export_onnx() helper called after each model save.
+  - train_and_save_all() now reports index type (IVF-PQ / Flat-L2 /
+    sklearn) in KNN metrics table.
+
+New dependencies (requirements.txt):
+  - faiss-cpu    — FAISS approximate nearest-neighbour library
+  - onnxruntime  — ONNX Runtime for INT8 quantized inference
+  - skl2onnx     — sklearn → ONNX model conversion
+  - onnxmltools   — XGBoost → ONNX model conversion
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMIT 2: Add SVM/KNN models, challenge flow, world map, and UI screenshots
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Files changed: api/main.py, api/routes/profiles.py, api/routes/submit.py,
+               db/models.py, frontend/package.json, frontend/package-lock.json,
+               frontend/src/api/client.ts, frontend/src/components/RiskScoreCard.tsx,
+               frontend/src/components/TransactionWorldMap.tsx (new),
+               frontend/src/pages/CustomerProfiles.tsx,
+               frontend/src/pages/SubmitTransaction.tsx,
+               ml/model.py, ml/train.py, monitoring/logger.py,
+               profiles/customer_profile.py, risk/engine.py,
+               screenshots/ (5 new PNG files), README.md
+
+ML Models:
+  - Added SVMModel class: RBF-kernel SVC with Platt scaling (probability=True),
+    StandardScaler in Pipeline.
+  - Added KNNModel class: KNeighborsClassifier(k=7, weights="distance"),
+    CalibratedClassifierCV(method="isotonic"), StandardScaler in Pipeline.
+  - Added ModelRegistry class managing all three ML models (XGBoost, SVM, KNN).
+    Exposes load_all(), score_all(), and fuse() for weighted ensemble scoring.
+  - Ensemble weights: Bayesian 40% | XGBoost 30% | SVM 20% | KNN 10%.
+  - Added get_registry() singleton accessor and reset_registry() for post-
+    retrain reload.
+  - train_and_save_all() trains all three models on the same dataset and saves
+    each with its evaluation metrics.
+
+Risk Engine (risk/engine.py):
+  - Replaced _fuse_scores() with _score_all_models() using ModelRegistry.
+  - evaluate_transaction_by_id() and evaluate_transaction_inline() now populate
+    RiskScore with bayesian_score, ml_score (XGBoost), svm_score, knn_score,
+    and model_scores (list of ModelScore objects with per-model metadata).
+
+Monitoring (monitoring/logger.py):
+  - log_prediction() extended to store svm_score and knn_score in PredictionLog
+    nodes in Neo4j.
+
+Challenge Verification (api/routes/submit.py):
+  - Added CHALLENGE_MAGIC_ANSWER = "TEST" constant.
+  - Added POST /submit/verify-challenge endpoint: if the submitted answer
+    matches "TEST" (case-insensitive), the transaction status is updated to
+    COMPLETED in Neo4j. Returns 422 on wrong answer.
+
+Customer Profile API (api/routes/profiles.py):
+  - Added FACTOR_EXPLANATIONS dictionary for human-readable risk factor details.
+  - Added GET /profiles/{customer_id}/transactions/{txn_id} endpoint: returns
+    full transaction detail, PredictionLog data, risk factor explanations, and
+    a narrative score explanation.
+  - Added GET /profiles/{customer_id}/transaction-map endpoint: aggregates
+    transactions by country with total counts, fraud counts, average/max risk
+    scores, and dominant risk level.
+
+API Startup (api/main.py):
+  - Lifespan function now calls get_registry() to pre-load all ML models.
+  - Health check endpoint reports status of xgboost, svm, knn individually
+    and the ensemble weights.
+  - Added POST /retrain endpoint to trigger train_and_save_all() on demand.
+
+Frontend — Multi-model Score Display (frontend/src/components/RiskScoreCard.tsx):
+  - Challenge state machine: tracks idle / submitting / passed / failed states.
+  - Calls verifyChallenge API; shows green "Challenge Passed" banner or red
+    error message.
+  - 2×2 model comparison grid: ModelScoreBar for Bayesian, XGBoost, SVM, KNN.
+    Each bar shows score, weighted contribution, and model-specific metadata.
+  - ModelAgreement component shows overall agreement between all four models.
+
+Frontend — World Map (frontend/src/components/TransactionWorldMap.tsx — new):
+  - D3-powered SVG world map using d3-geo and topojson-client.
+  - Fetches countries-110m.json from CDN for country geometries.
+  - Plots circles at country centroids: size by transaction count, colour by
+    risk level (LOW/MEDIUM/HIGH/CRITICAL).
+  - Pulsing rings for countries with fraud transactions.
+  - Hover tooltip with transactions, fraud count, amount, risk scores, FATF
+    risk level, and detected fraud patterns.
+  - Summary cards for top 8 countries below the map.
+
+Frontend — Customer Profiles (frontend/src/pages/CustomerProfiles.tsx):
+  - TransactionRow shows fraud type inline and adjusts dot colour for fraud
+    transactions.
+  - TransactionDrawer shows "Fraud Pattern Detected (Test Data)" panel when no
+    PredictionLog exists but is_fraud and fraud_type are set.
+  - TransactionWorldMap integrated into ProfilePanel between Risk Profile and
+    Mule Indicators.
+
+Frontend dependencies added (frontend/package.json):
+  - d3, @types/d3, topojson-client, @types/topojson-client
+
+Documentation (README.md):
+  - Added Screenshots section with 5 inline PNG images at the top of the file.
+
+Screenshots added (screenshots/):
+  - dashboard.png          — Main dashboard with transaction stats
+  - submit-transaction.png — Transaction submission form
+  - customer-profile.png   — Customer profile with D3 world map
+  - transaction-detail.png — Transaction drawer with 4-model risk breakdown
+  - model-monitor.png      — Model monitoring and drift detection
+
+Customer Profile backend (profiles/customer_profile.py):
+  - TRANSACTION_HISTORY_QUERY: removed 30-day timestamp filter so all
+    transactions are returned regardless of age.
+  - OPTIONAL MATCH corrected to use [:HAS_PREDICTION] explicit relationship.
+  - Added _FRAUD_SCORE_MAP to infer risk_score, outcome, and risk_factors for
+    seeded fraud transactions that lack PredictionLog entries.
+  - RiskProfile totals now derived from enriched transactions list.
+  - TransactionSummary dataclass extended with risk_factors field.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMIT 1: Add frontend, customer profiles, feature store, and model drift monitoring
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Frontend (React + Vite + TypeScript + Tailwind CSS):
+  - frontend/vite.config.ts       — Vite build config with API proxy to :8000
+  - frontend/src/index.css        — Tailwind CSS imports
+  - frontend/src/main.tsx         — React entry point
+  - frontend/src/App.tsx          — React Router routes
+  - frontend/src/api/client.ts    — Axios client and TypeScript interfaces
+  - frontend/src/components/Layout.tsx        — Responsive sidebar layout
+  - frontend/src/components/RiskScoreCard.tsx — Risk evaluation result display
+  - frontend/src/pages/Dashboard.tsx          — Transaction stats and charts
+  - frontend/src/pages/SubmitTransaction.tsx  — Transaction submission form
+  - frontend/src/pages/CustomerProfiles.tsx   — Customer list and profile panel
+  - frontend/src/pages/ModelMonitor.tsx       — Model drift and performance page
+
+Customer Profile Model (profiles/customer_profile.py):
+  - CustomerProfile, RiskProfile, MuleIndicators, TransactionSummary dataclasses.
+  - build_customer_profile() queries Neo4j to assemble a full profile including
+    transaction history, risk metrics, and mule account indicators.
+
+Feature Store (store/feature_store.py):
+  - compute_feature_snapshot() extracts and stores point-in-time feature
+    vectors for all transactions for use in drift detection.
+
+Model Drift Monitoring (monitoring/drift.py):
+  - compute_psi() calculates Population Stability Index between training and
+    serving feature distributions to detect feature drift.
+
+Performance Monitoring (monitoring/performance.py):
+  - Computes precision, recall, F1, and AUC metrics from PredictionLog nodes.
+
+Prediction Logging (monitoring/logger.py):
+  - log_prediction() writes a PredictionLog node to Neo4j linked to the
+    transaction via [:HAS_PREDICTION] relationship.
+
+API Routes:
+  - api/routes/profiles.py   — Customer profile and feature snapshot endpoints
+  - api/routes/monitoring.py — Drift and performance monitoring endpoints
+  - api/routes/submit.py     — Transaction submission endpoint
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMIT 0 (Initial): AML transaction risk engine with Neo4j graph database
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Core backend:
+  - docker-compose.yml         — Neo4j 5.15 with APOC + GDS plugins
+  - requirements.txt           — Python dependencies
+  - .env.example / .env        — Environment configuration
+  - config/settings.py         — Pydantic BaseSettings
+  - db/client.py               — Neo4j driver and session context manager
+  - db/schema.py               — Cypher constraints, indexes, query templates
+  - db/models.py               — Pydantic models for graph entities and API
+  - data/generator.py          — 1,000-transaction data generator (7 fraud types)
+  - risk/features.py           — 44-feature extractor (FeatureVector dataclass)
+  - risk/bayesian.py           — Bayesian log-odds risk engine
+  - risk/engine.py             — Orchestrator: extract → score → decide
+  - ml/model.py                — XGBoost/GBT model wrapper (AMLModel)
+  - ml/train.py                — Training pipeline
+  - api/main.py                — FastAPI application
+  - api/routes/transactions.py — Transaction CRUD and stats endpoints
+  - api/routes/evaluate.py     — Risk evaluation endpoints
+  - scripts/setup.py           — One-time setup: schema + data + train
+  - scripts/demo.py            — Interactive CLI demo
+  - .gitignore, README.md
+
+Graph data model follows ACAMS / FATF standard financial crime patterns:
+  Nodes: Customer, Account, Transaction, Device, IPAddress,
+         Merchant, BeneficiaryAccount, Country
+  Relationships: OWNS, INITIATED, CREDITED_TO, PAID_TO, ORIGINATED_FROM,
+                 SOURCED_FROM, SENT_TO_EXTERNAL, RESIDENT_OF, BASED_IN
+
+Risk scoring:
+  Score range 0–999:
+    0–399   ALLOW     — transaction proceeds automatically
+    400–699 CHALLENGE — present challenge question / OTP
+    700–999 DECLINE   — transaction blocked, compliance alerted
+  Bayesian engine: log-odds Naive Bayes with calibrated likelihood ratios
+  ML model: XGBoost gradient boosting, 44 graph-derived features,
+            scale_pos_weight=5, threshold calibrated via PR-curve F1
+
+Fraud patterns in seed data:
+  Structuring (~15), Smurfing (~16), Layering (~16), Round-tripping (~10),
+  Dormant Burst (~15), High-Risk Corridor (~15), Rapid Velocity (~30)
