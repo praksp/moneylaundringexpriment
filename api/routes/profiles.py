@@ -37,12 +37,13 @@ def _serialize(obj):
 @router.get("/")
 async def list_all_customers(
     skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=25, ge=1, le=100),
     risk_tier: str = Query(default=None, description="Filter: LOW / MEDIUM / HIGH / CRITICAL"),
+    search: str = Query(default=None, description="Case-insensitive name search"),
     _admin: UserInDB = Depends(require_admin),
 ):
-    """List all customers with summary info. Requires admin role."""
-    return list_customers(skip=skip, limit=limit, risk_tier=risk_tier)
+    """List customers with summary info. Supports name search and risk-tier filter. Requires admin role."""
+    return list_customers(skip=skip, limit=limit, risk_tier=risk_tier, search=search)
 
 
 @router.get("/high-risk-accounts")

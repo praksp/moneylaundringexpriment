@@ -4,7 +4,7 @@ import {
   Search, User, AlertTriangle, TrendingUp, TrendingDown, Minus,
   Shield, ChevronRight, X, ArrowRight, Monitor, Wifi, MapPin,
   Clock, Hash, Building2, CreditCard, ChevronDown, ChevronUp,
-  ExternalLink, Info, ChevronLeft, Layers,
+  ExternalLink, Info, Layers,
 } from 'lucide-react'
 import {
   listCustomers, getCustomerProfile, computeFeatureSnapshot,
@@ -508,9 +508,82 @@ function TransactionRow({ txn, onClick }: { txn: TransactionSummary; onClick: ()
   )
 }
 
+// ── Pagination helpers ────────────────────────────────────────────────────────
+
+/** Build a compact list of page numbers with ellipsis markers (null = gap). */
+function buildPageNumbers(current: number, total: number): (number | null)[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1)
+  const pages: (number | null)[] = [1]
+  if (current > 3) pages.push(null)
+  const lo = Math.max(2, current - 1)
+  const hi = Math.min(total - 1, current + 1)
+  for (let p = lo; p <= hi; p++) pages.push(p)
+  if (current < total - 2) pages.push(null)
+  pages.push(total)
+  return pages
+}
+
+function PaginationBar({
+  page, totalPages, total, pageSize, isFetching, onPage,
+}: {
+  page: number; totalPages: number; total: number; pageSize: number
+  isFetching: boolean; onPage: (p: number) => void
+}) {
+  if (totalPages <= 1) return null
+  const rangeStart = (page - 1) * pageSize + 1
+  const rangeEnd   = Math.min(page * pageSize, total)
+  const pills      = buildPageNumbers(page, totalPages)
+
+  return (
+    <div className="flex items-center justify-between bg-slate-800/60 rounded-lg px-3 py-2 flex-wrap gap-2">
+      <div className="flex items-center gap-1.5 text-xs text-slate-400">
+        <Layers size={12} className="text-slate-500" />
+        {rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()} of {total.toLocaleString()}
+        {isFetching && (
+          <div className="w-3 h-3 border border-blue-500/40 border-t-blue-400 rounded-full animate-spin ml-1" />
+        )}
+      </div>
+      <div className="flex items-center gap-0.5">
+        <button onClick={() => onPage(1)} disabled={page === 1}
+          className="px-1.5 py-1 rounded text-xs text-slate-400 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed">
+          «
+        </button>
+        <button onClick={() => onPage(page - 1)} disabled={page === 1}
+          className="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300">
+          ‹ Prev
+        </button>
+        {pills.map((p, i) =>
+          p === null ? (
+            <span key={`gap-${i}`} className="px-1 text-slate-600 text-xs select-none">…</span>
+          ) : (
+            <button key={p} onClick={() => onPage(p)}
+              className={clsx(
+                'min-w-[28px] h-6 px-1 rounded text-xs font-medium transition-colors',
+                p === page
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-400 hover:bg-slate-700 hover:text-slate-200',
+              )}>
+              {p}
+            </button>
+          )
+        )}
+        <button onClick={() => onPage(page + 1)} disabled={page === totalPages}
+          className="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300">
+          Next ›
+        </button>
+        <button onClick={() => onPage(totalPages)} disabled={page === totalPages}
+          className="px-1.5 py-1 rounded text-xs text-slate-400 hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed">
+          »
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
 // ── Paginated transaction list ────────────────────────────────────────────────
 
-const PAGE_SIZE = 500
+const TXN_PAGE_SIZE = 500
 
 function PaginatedTransactionList({
   customerId,
@@ -523,110 +596,37 @@ function PaginatedTransactionList({
 
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ['customer-txns', customerId, page] as [string, string, number],
-    queryFn: () => getCustomerTransactions(customerId, page, PAGE_SIZE),
+    queryFn: () => getCustomerTransactions(customerId, page, TXN_PAGE_SIZE),
     placeholderData: keepPreviousData,
   })
 
-  const totalPages  = data?.total_pages ?? 1
-  const total       = data?.total       ?? 0
-  const txns        = data?.transactions ?? []
+  const totalPages = data?.total_pages ?? 1
+  const total      = data?.total       ?? 0
+  const txns       = (data?.transactions ?? []) as TransactionSummary[]
 
-  const rangeStart  = data ? (page - 1) * PAGE_SIZE + 1 : 0
-  const rangeEnd    = data ? Math.min(page * PAGE_SIZE, total) : 0
+  const handlePage = (p: number) => setPage(Math.max(1, Math.min(totalPages, p)))
 
   return (
     <div className="bg-slate-900 rounded-xl border border-slate-800 p-5">
-      {/* Header */}
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold text-slate-300">Transaction History</h3>
-          <span className="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full">
-            {total.toLocaleString()} total
-          </span>
-          {isFetching && !isLoading && (
-            <div className="w-3 h-3 border border-blue-500/40 border-t-blue-400 rounded-full animate-spin" />
+          {total > 0 && (
+            <span className="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full">
+              {total.toLocaleString()} total
+            </span>
           )}
         </div>
         <span className="text-xs text-slate-500">Click any row for risk details</span>
       </div>
 
-      {/* Pagination controls — top */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-between mb-3 bg-slate-800/60 rounded-lg px-3 py-2">
-          <div className="flex items-center gap-1.5 text-xs text-slate-400">
-            <Layers size={12} className="text-slate-500" />
-            Showing {rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()} of{' '}
-            {total.toLocaleString()} transactions
-          </div>
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => setPage(1)}
-              disabled={page === 1}
-              className="p-1 rounded hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-400"
-              title="First page"
-            >
-              <ChevronLeft size={13} />
-            </button>
-            <button
-              onClick={() => setPage(p => Math.max(1, p - 1))}
-              disabled={page === 1}
-              className="px-2.5 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300"
-            >
-              Prev
-            </button>
+      <PaginationBar
+        page={page} totalPages={totalPages} total={total}
+        pageSize={TXN_PAGE_SIZE} isFetching={isFetching && !isLoading}
+        onPage={handlePage}
+      />
 
-            {/* Page number pills */}
-            <div className="flex items-center gap-0.5">
-              {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
-                let p: number
-                if (totalPages <= 7) {
-                  p = i + 1
-                } else if (page <= 4) {
-                  p = i < 6 ? i + 1 : totalPages
-                } else if (page >= totalPages - 3) {
-                  p = i === 0 ? 1 : totalPages - 6 + i
-                } else {
-                  const offsets = [-3, -2, -1, 0, 1, 2]
-                  p = i === 0 ? 1 : i < 6 ? page + offsets[i] : totalPages
-                }
-                return (
-                  <button
-                    key={p}
-                    onClick={() => setPage(p)}
-                    className={clsx(
-                      'w-7 h-6 rounded text-xs font-medium transition-colors',
-                      page === p
-                        ? 'bg-blue-600 text-white'
-                        : 'text-slate-400 hover:bg-slate-700 hover:text-slate-200',
-                    )}
-                  >
-                    {p}
-                  </button>
-                )
-              })}
-            </div>
-
-            <button
-              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-              disabled={page === totalPages}
-              className="px-2.5 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300"
-            >
-              Next
-            </button>
-            <button
-              onClick={() => setPage(totalPages)}
-              disabled={page === totalPages}
-              className="p-1 rounded hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-400"
-              title="Last page"
-            >
-              <ChevronRight size={13} />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Transaction rows */}
-      <div className="space-y-1.5 max-h-[420px] overflow-y-auto">
+      <div className={clsx('space-y-1.5 max-h-[420px] overflow-y-auto', totalPages > 1 && 'mt-3')}>
         {isLoading ? (
           <div className="flex items-center justify-center py-10 gap-2 text-slate-500 text-sm">
             <div className="w-4 h-4 border border-blue-500/40 border-t-blue-400 rounded-full animate-spin" />
@@ -641,28 +641,13 @@ function PaginatedTransactionList({
         )}
       </div>
 
-      {/* Pagination controls — bottom (repeated for long lists) */}
       {totalPages > 1 && !isLoading && (
-        <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-800">
-          <span className="text-xs text-slate-500">
-            Page {page} of {totalPages}  ·  {PAGE_SIZE} per page
-          </span>
-          <div className="flex gap-1">
-            <button
-              onClick={() => setPage(p => Math.max(1, p - 1))}
-              disabled={page === 1}
-              className="px-3 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 flex items-center gap-1"
-            >
-              <ChevronLeft size={12} /> Prev
-            </button>
-            <button
-              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-              disabled={page === totalPages}
-              className="px-3 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 flex items-center gap-1"
-            >
-              Next <ChevronRight size={12} />
-            </button>
-          </div>
+        <div className="mt-3 pt-3 border-t border-slate-800">
+          <PaginationBar
+            page={page} totalPages={totalPages} total={total}
+            pageSize={TXN_PAGE_SIZE} isFetching={false}
+            onPage={handlePage}
+          />
         </div>
       )}
     </div>
@@ -925,15 +910,39 @@ function CustomerCard({ customer, isSelected, onClick }: {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+const CUST_PAGE_SIZE = 25
+
 export default function CustomerProfiles() {
-  const [search, setSearch] = useState('')
+  const [search, setSearch]       = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [custPage, setCustPage]   = useState(1)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [riskFilter, setRiskFilter] = useState('')
   const [selectedTxn, setSelectedTxn] = useState<TransactionSummary | null>(null)
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['customers', riskFilter],
-    queryFn: () => listCustomers(0, 50, riskFilter || undefined),
+  // Debounce search so we don't hammer the API on every keypress
+  const searchTimer = useState<ReturnType<typeof setTimeout> | null>(null)
+  const handleSearch = (val: string) => {
+    setSearch(val)
+    setCustPage(1)
+    if (searchTimer[0]) clearTimeout(searchTimer[0])
+    searchTimer[1](setTimeout(() => setDebouncedSearch(val), 350))
+  }
+
+  const handleRiskFilter = (val: string) => {
+    setRiskFilter(val)
+    setCustPage(1)
+  }
+
+  const { data, isLoading, isFetching: custFetching } = useQuery({
+    queryKey: ['customers', debouncedSearch, riskFilter, custPage] as [string, string, string, number],
+    queryFn: () => listCustomers(
+      (custPage - 1) * CUST_PAGE_SIZE,
+      CUST_PAGE_SIZE,
+      riskFilter || undefined,
+      debouncedSearch || undefined,
+    ),
+    placeholderData: keepPreviousData,
   })
 
   const { data: profile, isLoading: profileLoading } = useQuery({
@@ -942,35 +951,34 @@ export default function CustomerProfiles() {
     enabled: !!selectedId,
   })
 
-  const customers = (data?.customers || []) as CustomerRow[]
-  const filtered = customers.filter(c =>
-    !search || c.name?.toLowerCase().includes(search.toLowerCase())
-  )
+  const totalCustomers = data?.total ?? 0
+  const totalCustPages = Math.max(1, Math.ceil(totalCustomers / CUST_PAGE_SIZE))
+  const filtered = (data?.customers || []) as CustomerRow[]
 
   return (
     <div className="p-8 max-w-7xl mx-auto">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-white">Customer Profiles</h1>
         <p className="text-slate-400 text-sm mt-1">
-          {data?.total || 0} customers · Click a customer, then click any transaction to see the full risk score breakdown
+          {totalCustomers.toLocaleString()} customers · Click a customer to view their profile, then click any transaction for risk details
         </p>
       </div>
 
       {/* Filters */}
-      <div className="flex gap-3 mb-5">
+      <div className="flex gap-3 mb-3 flex-wrap">
         <div className="relative flex-1 max-w-xs">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
           <input
             type="text"
             placeholder="Search by name…"
             value={search}
-            onChange={e => setSearch(e.target.value)}
+            onChange={e => handleSearch(e.target.value)}
             className="w-full pl-9 pr-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
           />
         </div>
         <select
           value={riskFilter}
-          onChange={e => setRiskFilter(e.target.value)}
+          onChange={e => handleRiskFilter(e.target.value)}
           className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
         >
           <option value="">All Risk Tiers</option>
@@ -981,21 +989,41 @@ export default function CustomerProfiles() {
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
-        {/* Customer list */}
-        <div className="xl:col-span-2 space-y-2 max-h-[calc(100vh-220px)] overflow-y-auto pr-1">
-          {isLoading ? (
-            <div className="text-center py-12 text-slate-500">Loading customers…</div>
-          ) : filtered.length === 0 ? (
-            <div className="text-center py-12 text-slate-500">No customers found</div>
-          ) : (
-            filtered.map(c => (
-              <CustomerCard
-                key={c.id}
-                customer={c}
-                isSelected={selectedId === c.id}
-                onClick={() => setSelectedId(c.id)}
-              />
-            ))
+        {/* Customer list + pagination */}
+        <div className="xl:col-span-2 flex flex-col gap-2">
+          {/* Customer pagination bar */}
+          <PaginationBar
+            page={custPage} totalPages={totalCustPages}
+            total={totalCustomers} pageSize={CUST_PAGE_SIZE}
+            isFetching={custFetching && !isLoading}
+            onPage={p => { setCustPage(p); setSelectedId(null) }}
+          />
+
+          <div className="space-y-2 max-h-[calc(100vh-290px)] overflow-y-auto pr-1">
+            {isLoading ? (
+              <div className="text-center py-12 text-slate-500">Loading customers…</div>
+            ) : filtered.length === 0 ? (
+              <div className="text-center py-12 text-slate-500">No customers found</div>
+            ) : (
+              filtered.map(c => (
+                <CustomerCard
+                  key={c.id}
+                  customer={c}
+                  isSelected={selectedId === c.id}
+                  onClick={() => setSelectedId(c.id)}
+                />
+              ))
+            )}
+          </div>
+
+          {/* Bottom pagination */}
+          {totalCustPages > 1 && (
+            <PaginationBar
+              page={custPage} totalPages={totalCustPages}
+              total={totalCustomers} pageSize={CUST_PAGE_SIZE}
+              isFetching={false}
+              onPage={p => { setCustPage(p); setSelectedId(null) }}
+            />
           )}
         </div>
 

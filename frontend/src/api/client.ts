@@ -245,8 +245,8 @@ export const evaluateTransaction = (txnId: string) =>
 export const getCustomerProfile = (customerId: string) =>
   api.get<CustomerProfile>(`/profiles/${customerId}`).then(r => r.data)
 
-export const listCustomers = (skip = 0, limit = 20, riskTier?: string) =>
-  api.get('/profiles/', { params: { skip, limit, risk_tier: riskTier } }).then(r => r.data)
+export const listCustomers = (skip = 0, limit = 25, riskTier?: string, search?: string) =>
+  api.get('/profiles/', { params: { skip, limit, risk_tier: riskTier || undefined, search: search || undefined } }).then(r => r.data)
 
 export const getHighRiskAccounts = () =>
   api.get('/profiles/high-risk-accounts').then(r => r.data)

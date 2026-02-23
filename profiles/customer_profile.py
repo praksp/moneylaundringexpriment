@@ -533,9 +533,27 @@ def get_customer_transactions_page(
     }
 
 
-def list_customers(skip: int = 0, limit: int = 20, risk_tier: str = None) -> dict:
-    """List customers with summary info."""
-    where = f"WHERE c.risk_tier = '{risk_tier}'" if risk_tier else ""
+def list_customers(
+    skip: int = 0,
+    limit: int = 25,
+    risk_tier: str = None,
+    search: str = None,
+) -> dict:
+    """List customers with summary info, supporting name search and risk-tier filter."""
+    # Build WHERE clause using parameterised values to prevent injection
+    conditions = []
+    params: dict = {"skip": skip, "limit": limit}
+
+    if risk_tier:
+        conditions.append("c.risk_tier = $risk_tier")
+        params["risk_tier"] = risk_tier
+
+    if search:
+        conditions.append("toLower(c.name) CONTAINS toLower($search)")
+        params["search"] = search
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
     with neo4j_session() as session:
         result = session.run(f"""
             MATCH (c:Customer) {where}
@@ -549,7 +567,10 @@ def list_customers(skip: int = 0, limit: int = 20, risk_tier: str = None) -> dic
                    account_count
             ORDER BY c.risk_tier DESC, c.name
             SKIP $skip LIMIT $limit
-        """, skip=skip, limit=limit)
+        """, **params)
         customers = [dict(r) for r in result]
-        total = session.run(f"MATCH (c:Customer) {where} RETURN count(c) AS n").single()["n"]
+        total = session.run(
+            f"MATCH (c:Customer) {where} RETURN count(c) AS n",
+            **{k: v for k, v in params.items() if k not in ("skip", "limit")}
+        ).single()["n"]
     return {"total": total, "customers": customers}
