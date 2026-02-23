@@ -41,10 +41,10 @@ def log_prediction(
     confidence: float,
     processing_time_ms: float,
     is_fraud_ground_truth: bool | None = None,
+    svm_score: int = 0,
+    knn_score: int = 0,
 ) -> str:
-    """
-    Persist a prediction log entry. Returns the log ID.
-    """
+    """Persist a prediction log entry. Returns the log ID."""
     log_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
 
@@ -56,6 +56,8 @@ def log_prediction(
                 timestamp: $timestamp,
                 bayesian_score: $bayesian_score,
                 ml_score: $ml_score,
+                svm_score: $svm_score,
+                knn_score: $knn_score,
                 final_score: $final_score,
                 outcome: $outcome,
                 risk_factors: $risk_factors,
@@ -75,6 +77,8 @@ def log_prediction(
             timestamp=now,
             bayesian_score=bayesian_score,
             ml_score=ml_score,
+            svm_score=svm_score,
+            knn_score=knn_score,
             final_score=final_score,
             outcome=outcome,
             risk_factors=risk_factors,

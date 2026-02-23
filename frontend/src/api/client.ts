@@ -7,10 +7,22 @@ export const api = axios.create({
 
 // ── Types ──────────────────────────────────────────────────────────────
 
+export interface ModelScore {
+  score: number           // 0-999
+  probability: number     // 0.0-1.0
+  label: string           // "Bayesian Engine", "XGBoost", "SVM (RBF)", "KNN (k=7)"
+  short: string           // "bayesian", "xgb", "svm", "knn"
+  is_trained: boolean
+  weight_pct: number      // % weight in the ensemble
+}
+
 export interface RiskScore {
   score: number
   bayesian_score: number
-  ml_score: number
+  ml_score: number        // XGBoost score
+  svm_score: number
+  knn_score: number
+  model_scores: ModelScore[]
   outcome: 'ALLOW' | 'CHALLENGE' | 'DECLINE'
   risk_factors: string[]
   confidence: number
@@ -106,6 +118,7 @@ export interface TransactionSummary {
   receiver_name: string | null
   risk_score: number | null
   outcome: string | null
+  risk_factors: string[]
 }
 
 export interface RiskProfile {
@@ -210,6 +223,70 @@ export const getHighRiskAccounts = () =>
 
 export const computeFeatureSnapshot = (customerId: string, accountId: string) =>
   api.post(`/profiles/${customerId}/accounts/${accountId}/feature-snapshot`).then(r => r.data)
+
+export interface RiskFactorDetail {
+  factor: string
+  title: string
+  detail: string
+  severity: 'critical' | 'high' | 'medium' | 'low'
+}
+
+export interface ScoreExplanation {
+  summary: string
+  score: number
+  risk_level: string
+  bayesian_contribution: string
+  ml_contribution: string
+  factor_count: number
+  confidence_pct: number
+  model_agreement: string
+}
+
+export interface TransactionDetail {
+  transaction: Record<string, unknown>
+  sender_account: Record<string, unknown> | null
+  receiver_account: Record<string, unknown> | null
+  sender_customer: Record<string, unknown> | null
+  receiver_customer: Record<string, unknown> | null
+  device: Record<string, unknown> | null
+  ip_address: Record<string, unknown> | null
+  merchant: Record<string, unknown> | null
+  beneficiary: Record<string, unknown> | null
+  sender_country: Record<string, unknown> | null
+  receiver_country: Record<string, unknown> | null
+  prediction: Record<string, unknown> | null
+  risk_factor_details: RiskFactorDetail[]
+  score_explanation: ScoreExplanation
+}
+
+export const getTransactionDetail = (customerId: string, txnId: string) =>
+  api.get<TransactionDetail>(`/profiles/${customerId}/transactions/${txnId}`).then(r => r.data)
+
+export interface CountryMapEntry {
+  code: string
+  name: string
+  fatf_risk: string
+  txn_count: number
+  fraud_count: number
+  total_amount: number
+  avg_score: number | null
+  max_score: number | null
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  directions: string[]
+  fraud_types: string[]
+}
+
+export const getTransactionMap = (customerId: string) =>
+  api.get<{ countries: CountryMapEntry[]; total_countries: number }>(
+    `/profiles/${customerId}/transaction-map`
+  ).then(r => r.data)
+
+export const verifyChallenge = (payload: {
+  transaction_id: string
+  question_id: string
+  answer: string
+}) =>
+  api.post('/submit/verify-challenge', payload).then(r => r.data)
 
 export const getMonitoringSummary = () =>
   api.get<MonitoringSummary>('/monitoring/summary').then(r => r.data)

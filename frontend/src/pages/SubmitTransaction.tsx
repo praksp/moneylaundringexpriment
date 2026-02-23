@@ -265,13 +265,7 @@ export default function SubmitTransaction() {
         {/* Result */}
         <div>
           {result ? (
-            <RiskScoreCard
-              result={result}
-              onChallengeAnswer={(ans) => {
-                // In production this would validate the answer
-                console.log('Challenge answer:', ans)
-              }}
-            />
+            <RiskScoreCard result={result} />
           ) : (
             <div className="bg-slate-900 rounded-xl border border-slate-800 border-dashed p-12 text-center">
               <Send size={36} className="text-slate-600 mx-auto mb-3" />

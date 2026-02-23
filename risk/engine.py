@@ -22,15 +22,11 @@ import random
 from typing import Optional
 
 from db.client import neo4j_session
-from db.models import TransactionOutcome, RiskScore, ChallengeQuestion
+from db.models import TransactionOutcome, RiskScore, ModelScore, ChallengeQuestion
 from risk.features import extract_features, FeatureVector
 from risk.bayesian import compute_bayesian_score
-from ml.model import get_model
+from ml.model import get_registry
 from config.settings import settings
-
-# Weights for score fusion
-BAYESIAN_WEIGHT = 0.55
-ML_WEIGHT = 0.45
 
 CHALLENGE_QUESTIONS = [
     "Please confirm this transaction by entering the OTP sent to your registered mobile number.",
@@ -179,10 +175,50 @@ def _fetch_graph_context(txn_id: str) -> Optional[dict]:
         }
 
 
-def _fuse_scores(bayesian_score: int, ml_score: int) -> int:
-    """Weighted linear fusion of Bayesian and ML scores."""
-    fused = (bayesian_score * BAYESIAN_WEIGHT) + (ml_score * ML_WEIGHT)
-    return max(0, min(999, round(fused)))
+def _score_all_models(fv: FeatureVector, bayesian_score: int) -> tuple[int, dict, list]:
+    """
+    Run all models and return (final_score, ml_scores_dict, model_score_objects).
+    """
+    registry = get_registry()
+    ml_scores = registry.score_all(fv)           # {"xgb": int, "svm": int, "knn": int}
+    final_score = registry.fuse(bayesian_score, ml_scores)
+
+    weights = registry.ENSEMBLE_WEIGHTS
+    model_score_objs = [
+        ModelScore(
+            score=bayesian_score,
+            probability=round(bayesian_score / 999, 4),
+            label="Bayesian Engine",
+            short="bayesian",
+            is_trained=True,
+            weight_pct=round(weights["bayesian"] * 100),
+        ),
+        ModelScore(
+            score=ml_scores.get("xgb", 0),
+            probability=round(ml_scores.get("xgb", 0) / 999, 4),
+            label="XGBoost",
+            short="xgb",
+            is_trained=registry.xgb.is_trained,
+            weight_pct=round(weights["xgb"] * 100),
+        ),
+        ModelScore(
+            score=ml_scores.get("svm", 0),
+            probability=round(ml_scores.get("svm", 0) / 999, 4),
+            label="SVM (RBF)",
+            short="svm",
+            is_trained=registry.svm.is_trained,
+            weight_pct=round(weights["svm"] * 100),
+        ),
+        ModelScore(
+            score=ml_scores.get("knn", 0),
+            probability=round(ml_scores.get("knn", 0) / 999, 4),
+            label="KNN (k=7)",
+            short="knn",
+            is_trained=registry.knn.is_trained,
+            weight_pct=round(weights["knn"] * 100),
+        ),
+    ]
+    return final_score, ml_scores, model_score_objs
 
 
 def _determine_outcome(score: int) -> TransactionOutcome:
@@ -244,29 +280,24 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
     bayes_result = compute_bayesian_score(fv)
     bayesian_score = bayes_result.score
 
-    # ── ML score ─────────────────────────────────────────────────
-    ml_score = 0
-    try:
-        model = get_model()
-        if model.is_trained:
-            ml_prob = model.predict_proba_single(fv)
-            ml_score = max(0, min(999, round(ml_prob * 999)))
-    except Exception:
-        ml_score = bayesian_score  # fallback if model not loaded
-
-    # ── Fused score ───────────────────────────────────────────────
-    final_score = _fuse_scores(bayesian_score, ml_score)
+    # ── All ML models ─────────────────────────────────────────────
+    final_score, ml_scores, model_score_objs = _score_all_models(fv, bayesian_score)
+    xgb_score = ml_scores.get("xgb", 0)
+    svm_score  = ml_scores.get("svm", 0)
+    knn_score  = ml_scores.get("knn", 0)
 
     # ── Outcome decision ─────────────────────────────────────────
     outcome = _determine_outcome(final_score)
     explanation = _build_explanation(outcome, final_score, bayes_result.triggered_factors)
-
     confidence = min(1.0, abs(bayes_result.probability - 0.5) * 2 + 0.5)
 
     risk_score = RiskScore(
         score=final_score,
         bayesian_score=bayesian_score,
-        ml_score=ml_score,
+        ml_score=xgb_score,
+        svm_score=svm_score,
+        knn_score=knn_score,
+        model_scores=model_score_objs,
         outcome=outcome,
         risk_factors=bayes_result.triggered_factors,
         confidence=round(confidence, 4),
@@ -285,13 +316,15 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
         log_prediction(
             transaction_id=txn_id,
             bayesian_score=bayesian_score,
-            ml_score=ml_score,
+            ml_score=xgb_score,
             final_score=final_score,
             outcome=outcome.value,
             risk_factors=bayes_result.triggered_factors,
             feature_vector=fv.to_ml_array(),
             confidence=round(confidence, 4),
             processing_time_ms=round(elapsed_ms, 2),
+            svm_score=svm_score,
+            knn_score=knn_score,
         )
     except Exception:
         pass
@@ -317,16 +350,11 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
     bayes_result = compute_bayesian_score(fv)
     bayesian_score = bayes_result.score
 
-    ml_score = bayesian_score
-    try:
-        model = get_model()
-        if model.is_trained:
-            ml_prob = model.predict_proba_single(fv)
-            ml_score = max(0, min(999, round(ml_prob * 999)))
-    except Exception:
-        pass
+    final_score, ml_scores, model_score_objs = _score_all_models(fv, bayesian_score)
+    xgb_score = ml_scores.get("xgb", 0)
+    svm_score  = ml_scores.get("svm", 0)
+    knn_score  = ml_scores.get("knn", 0)
 
-    final_score = _fuse_scores(bayesian_score, ml_score)
     outcome = _determine_outcome(final_score)
     explanation = _build_explanation(outcome, final_score, bayes_result.triggered_factors)
     confidence = min(1.0, abs(bayes_result.probability - 0.5) * 2 + 0.5)
@@ -334,7 +362,10 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
     risk_score = RiskScore(
         score=final_score,
         bayesian_score=bayesian_score,
-        ml_score=ml_score,
+        ml_score=xgb_score,
+        svm_score=svm_score,
+        knn_score=knn_score,
+        model_scores=model_score_objs,
         outcome=outcome,
         risk_factors=bayes_result.triggered_factors,
         confidence=round(confidence, 4),
@@ -352,13 +383,15 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
         log_prediction(
             transaction_id=txn_id,
             bayesian_score=bayesian_score,
-            ml_score=ml_score,
+            ml_score=xgb_score,
             final_score=final_score,
             outcome=outcome.value,
             risk_factors=bayes_result.triggered_factors,
             feature_vector=fv.to_ml_array(),
             confidence=round(confidence, 4),
             processing_time_ms=round(elapsed_ms, 2),
+            svm_score=svm_score,
+            knn_score=knn_score,
         )
     except Exception:
         pass

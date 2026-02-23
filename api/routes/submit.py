@@ -14,6 +14,9 @@ from risk.engine import evaluate_transaction_by_id
 
 router = APIRouter(prefix="/submit", tags=["Transaction Submission"])
 
+# Magic answer that always passes a challenge — used for testing
+CHALLENGE_MAGIC_ANSWER = "TEST"
+
 
 class SubmitTransactionRequest(BaseModel):
     sender_account_id: str = Field(..., description="ID of the sending account")
@@ -145,6 +148,52 @@ async def submit_transaction(req: SubmitTransactionRequest):
         return TransactionEvaluationResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+
+class VerifyChallengeRequest(BaseModel):
+    transaction_id: str
+    question_id: str
+    answer: str
+
+
+@router.post("/verify-challenge")
+async def verify_challenge(req: VerifyChallengeRequest):
+    """
+    Verify a challenge answer.
+    If the answer matches the magic word 'TEST' (case-insensitive),
+    the transaction is committed and its status set to COMPLETED.
+    Any other answer is rejected.
+    """
+    if req.answer.strip().upper() != CHALLENGE_MAGIC_ANSWER:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "success": False,
+                "message": "Incorrect answer. The transaction remains on hold.",
+            },
+        )
+
+    with neo4j_session() as session:
+        record = session.run(
+            "MATCH (t:Transaction {id: $id}) RETURN t.status AS status, t.reference AS ref",
+            id=req.transaction_id,
+        ).single()
+
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Transaction {req.transaction_id} not found")
+
+        # Commit the transaction
+        session.run(
+            "MATCH (t:Transaction {id: $id}) SET t.status = 'COMPLETED'",
+            id=req.transaction_id,
+        )
+
+    return {
+        "success": True,
+        "transaction_id": req.transaction_id,
+        "new_status": "COMPLETED",
+        "message": "Challenge passed. Transaction has been committed successfully.",
+    }
 
 
 @router.get("/accounts")

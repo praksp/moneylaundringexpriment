@@ -2,6 +2,23 @@
 
 An Anti-Money Laundering (AML) detection system built on a **Neo4j graph database** with a **Bayesian + ML risk scoring engine** that evaluates financial transactions in near real-time.
 
+## Screenshots
+
+### Dashboard
+![Dashboard](screenshots/dashboard.png)
+
+### Submit Transaction
+![Submit Transaction](screenshots/submit-transaction.png)
+
+### Customer Profile with World Map
+![Customer Profile](screenshots/customer-profile.png)
+
+### Transaction Detail & Risk Breakdown
+![Transaction Detail](screenshots/transaction-detail.png)
+
+### Model Monitor & Drift Detection
+![Model Monitor](screenshots/model-monitor.png)
+
 ## Architecture
 
 ```

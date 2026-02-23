@@ -191,10 +191,23 @@ class TransactionEvaluationRequest(BaseModel):
     beneficiary_country: Optional[str] = None
 
 
-class RiskScore(BaseModel):
+class ModelScore(BaseModel):
+    """Individual model score with metadata."""
     score: int                      # 0-999
-    bayesian_score: int
-    ml_score: int
+    probability: float              # Raw fraud probability 0.0-1.0
+    label: str                      # e.g. "XGBoost", "SVM", "KNN", "Bayesian"
+    short: str                      # e.g. "xgb", "svm", "knn", "bayesian"
+    is_trained: bool = True
+    weight_pct: int                 # % weight in the ensemble
+
+
+class RiskScore(BaseModel):
+    score: int                      # 0-999 ensemble score
+    bayesian_score: int             # Kept for backward compat
+    ml_score: int                   # XGBoost score (primary ML model)
+    svm_score: int = 0
+    knn_score: int = 0
+    model_scores: list[ModelScore] = []  # All individual model scores
     outcome: TransactionOutcome
     risk_factors: list[str]
     confidence: float               # 0.0 - 1.0

@@ -25,7 +25,7 @@ from api.routes.profiles import router as profiles_router
 from api.routes.monitoring import router as monitoring_router
 from api.routes.submit import router as submit_router
 from db.client import get_driver, close_driver
-from ml.model import get_model
+from ml.model import get_model, get_registry
 from monitoring.logger import ensure_schema
 from config.settings import settings
 
@@ -34,7 +34,8 @@ from config.settings import settings
 async def lifespan(app: FastAPI):
     # Startup
     get_driver()        # Verify Neo4j connectivity
-    get_model()         # Pre-load ML model
+    get_model()         # Pre-load XGBoost (legacy)
+    get_registry()      # Pre-load all models (XGBoost + SVM + KNN)
     ensure_schema()     # Prediction log constraints
     yield
     # Shutdown
@@ -68,7 +69,7 @@ app.include_router(monitoring_router)
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """Service health check including Neo4j connectivity and ML model status."""
+    """Service health check including Neo4j connectivity and all ML model status."""
     neo4j_ok = False
     neo4j_error = None
     try:
@@ -78,18 +79,38 @@ async def health_check():
     except Exception as e:
         neo4j_error = str(e)
 
-    model = get_model()
-    model_ok = model.is_trained
+    registry = get_registry()
+    models_status = {
+        "xgboost": registry.xgb.is_trained,
+        "svm": registry.svm.is_trained,
+        "knn": registry.knn.is_trained,
+    }
+    all_models_ok = any(models_status.values())
 
     return {
-        "status": "healthy" if (neo4j_ok and model_ok) else "degraded",
+        "status": "healthy" if (neo4j_ok and all_models_ok) else "degraded",
         "neo4j": {"connected": neo4j_ok, "error": neo4j_error},
-        "ml_model": {"loaded": model_ok},
+        "ml_models": models_status,
+        "ensemble_weights": registry.ENSEMBLE_WEIGHTS,
         "risk_thresholds": {
             "ALLOW": f"0–{settings.risk_allow_max}",
             "CHALLENGE": f"{settings.risk_allow_max + 1}–{settings.risk_challenge_max}",
             "DECLINE": f"{settings.risk_challenge_max + 1}–999",
         },
+    }
+
+
+@app.post("/retrain", tags=["System"])
+async def retrain_models():
+    """Retrain all three ML models (XGBoost, SVM, KNN) from the current Neo4j dataset."""
+    import asyncio
+    from ml.train import train_and_save_all
+    loop = asyncio.get_event_loop()
+    metrics = await loop.run_in_executor(None, train_and_save_all)
+    return {
+        "status": "success",
+        "message": "All models retrained and saved",
+        "metrics": metrics,
     }
 
 
