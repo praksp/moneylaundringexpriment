@@ -24,19 +24,22 @@ from api.routes.evaluate import router as eval_router
 from api.routes.profiles import router as profiles_router
 from api.routes.monitoring import router as monitoring_router
 from api.routes.submit import router as submit_router
+from api.routes.auth import router as auth_router
 from db.client import get_driver, close_driver
 from ml.model import get_model, get_registry
 from monitoring.logger import ensure_schema
+from auth.security import seed_default_users
 from config.settings import settings
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    get_driver()        # Verify Neo4j connectivity
-    get_model()         # Pre-load XGBoost (legacy)
-    get_registry()      # Pre-load all models (XGBoost + SVM + KNN)
-    ensure_schema()     # Prediction log constraints
+    get_driver()            # Verify Neo4j connectivity
+    get_model()             # Pre-load XGBoost (legacy)
+    get_registry()          # Pre-load all models (XGBoost + SVM + KNN)
+    ensure_schema()         # Prediction log constraints
+    seed_default_users()    # Create admin/viewer users if not present
     yield
     # Shutdown
     close_driver()
@@ -60,6 +63,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(submit_router)
 app.include_router(txn_router)
 app.include_router(eval_router)

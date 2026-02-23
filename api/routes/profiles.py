@@ -1,11 +1,20 @@
-"""Customer profile API routes."""
-from fastapi import APIRouter, HTTPException, Query
+"""
+Customer profile API routes.
+
+All endpoints in this router require the requesting user to hold the
+'admin' role.  Customer PII (name, nationality, account numbers, etc.)
+is only visible to admins.  Viewer-role users are directed to the
+/transactions/aggregate endpoint instead.
+"""
+from fastapi import APIRouter, HTTPException, Query, Depends
 from profiles.customer_profile import build_customer_profile, list_customers
 from store.feature_store import (
     compute_and_store_feature_snapshot, get_latest_snapshot,
     list_high_risk_accounts,
 )
 from db.client import neo4j_session
+from auth.dependencies import require_admin
+from auth.models import UserInDB
 import dataclasses
 import json
 
@@ -28,22 +37,30 @@ async def list_all_customers(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
     risk_tier: str = Query(default=None, description="Filter: LOW / MEDIUM / HIGH / CRITICAL"),
+    _admin: UserInDB = Depends(require_admin),
 ):
-    """List all customers with summary info."""
+    """List all customers with summary info. Requires admin role."""
     return list_customers(skip=skip, limit=limit, risk_tier=risk_tier)
 
 
 @router.get("/high-risk-accounts")
-async def get_high_risk_accounts(limit: int = Query(default=50, ge=1, le=200)):
-    """Accounts flagged as likely mules or high-risk by the feature store."""
+async def get_high_risk_accounts(
+    limit: int = Query(default=50, ge=1, le=200),
+    _admin: UserInDB = Depends(require_admin),
+):
+    """Accounts flagged as likely mules or high-risk by the feature store. Requires admin role."""
     return {"accounts": list_high_risk_accounts(limit=limit)}
 
 
 @router.get("/{customer_id}")
-async def get_customer_profile(customer_id: str):
+async def get_customer_profile(
+    customer_id: str,
+    _admin: UserInDB = Depends(require_admin),
+):
     """
     Full customer profile including accounts, transaction history,
     risk profile, network connections, and mule indicators.
+    Requires admin role — contains PII.
     """
     profile = build_customer_profile(customer_id)
     if profile is None:
@@ -52,11 +69,12 @@ async def get_customer_profile(customer_id: str):
 
 
 @router.post("/{customer_id}/accounts/{account_id}/feature-snapshot")
-async def compute_feature_snapshot(customer_id: str, account_id: str):
-    """
-    Compute and persist a feature snapshot for a specific account.
-    Used to populate the feature store and detect mule patterns.
-    """
+async def compute_feature_snapshot(
+    customer_id: str,
+    account_id: str,
+    _admin: UserInDB = Depends(require_admin),
+):
+    """Compute and persist a feature snapshot. Requires admin role."""
     snapshot = compute_and_store_feature_snapshot(customer_id, account_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Customer or account not found")
@@ -64,8 +82,12 @@ async def compute_feature_snapshot(customer_id: str, account_id: str):
 
 
 @router.get("/{customer_id}/accounts/{account_id}/feature-snapshot")
-async def get_feature_snapshot(customer_id: str, account_id: str):
-    """Retrieve the latest feature snapshot for an account."""
+async def get_feature_snapshot(
+    customer_id: str,
+    account_id: str,
+    _admin: UserInDB = Depends(require_admin),
+):
+    """Retrieve the latest feature snapshot for an account. Requires admin role."""
     snapshot = get_latest_snapshot(account_id)
     if snapshot is None:
         raise HTTPException(
@@ -251,7 +273,10 @@ FACTOR_EXPLANATIONS: dict[str, dict] = {
 
 
 @router.get("/{customer_id}/transaction-map")
-async def get_transaction_map(customer_id: str):
+async def get_transaction_map(
+    customer_id: str,
+    _admin: UserInDB = Depends(require_admin),
+):
     """
     Aggregate a customer's transactions by country for the world-map heat-map.
     Returns one entry per country code (sender OR receiver/beneficiary) with
@@ -358,7 +383,11 @@ async def get_transaction_map(customer_id: str):
 
 
 @router.get("/{customer_id}/transactions/{txn_id}")
-async def get_transaction_detail(customer_id: str, txn_id: str):
+async def get_transaction_detail(
+    customer_id: str,
+    txn_id: str,
+    _admin: UserInDB = Depends(require_admin),
+):
     """
     Full transaction detail with risk score breakdown and factor explanations.
     Designed to show the analyst exactly why the risk score is the way it is.

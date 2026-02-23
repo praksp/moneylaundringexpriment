@@ -1,6 +1,7 @@
 """Transaction management routes."""
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from db.client import neo4j_session
+from auth.dependencies import require_viewer_or_admin
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
@@ -112,6 +113,120 @@ async def get_transaction(txn_id: str):
         "ip_address": _n(record["ip"]),
         "merchant": _n(record["merchant"]),
         "beneficiary": _n(record["beneficiary"]),
+    }
+
+
+@router.get("/aggregate/world-map", dependencies=[Depends(require_viewer_or_admin)])
+async def aggregate_world_map():
+    """
+    Aggregated transaction heatmap by country — no customer PII.
+    Available to all authenticated users (admin + viewer).
+    Returns per-country totals, fraud counts, risk distribution,
+    and transaction volume for the global heatmap.
+    """
+    with neo4j_session() as session:
+        rows = session.run("""
+            MATCH (a:Account)-[:INITIATED]->(t:Transaction)
+            OPTIONAL MATCH (a)-[:BASED_IN]->(sc:Country)
+            OPTIONAL MATCH (t)-[:CREDITED_TO]->(ra:Account)-[:BASED_IN]->(rc:Country)
+            OPTIONAL MATCH (t)-[:SENT_TO_EXTERNAL]->(b:BeneficiaryAccount)
+            OPTIONAL MATCH (t)-[:HAS_PREDICTION]->(pl:PredictionLog)
+            RETURN
+                sc.code AS sender_cc, sc.name AS sender_name,
+                sc.fatf_risk AS sender_fatf,
+                rc.code AS recv_cc, rc.name AS recv_name,
+                rc.fatf_risk AS recv_fatf,
+                b.country AS bene_cc,
+                t.is_fraud AS is_fraud, t.fraud_type AS fraud_type,
+                t.amount AS amount, t.type AS txn_type,
+                COALESCE(pl.final_score,
+                    CASE t.is_fraud WHEN true THEN 720 ELSE null END) AS score,
+                COALESCE(pl.outcome,
+                    CASE t.is_fraud WHEN true THEN 'DECLINE' ELSE null END) AS outcome
+        """).data()
+
+    country_stats: dict[str, dict] = {}
+
+    def _add(code, name, fatf, amount, score, is_fraud, fraud_type, txn_type, direction):
+        if not code:
+            return
+        if code not in country_stats:
+            country_stats[code] = {
+                "code": code, "name": name or code,
+                "fatf_risk": fatf or "LOW",
+                "txn_count": 0, "fraud_count": 0,
+                "total_amount": 0.0, "scores": [],
+                "directions": set(), "fraud_types": set(),
+                "txn_types": set(),
+            }
+        s = country_stats[code]
+        s["txn_count"] += 1
+        s["total_amount"] += float(amount or 0)
+        if is_fraud:
+            s["fraud_count"] += 1
+            if fraud_type:
+                s["fraud_types"].add(fraud_type)
+        if score is not None:
+            s["scores"].append(int(score))
+        s["directions"].add(direction)
+        if txn_type:
+            s["txn_types"].add(txn_type)
+
+    for r in rows:
+        amt = r.get("amount", 0) or 0
+        fraud = bool(r.get("is_fraud", False))
+        ftype = r.get("fraud_type")
+        score = r.get("score")
+        ttype = r.get("txn_type")
+        _add(r.get("sender_cc"), r.get("sender_name"), r.get("sender_fatf"),
+             amt, score, fraud, ftype, ttype, "sender")
+        _add(r.get("recv_cc"), r.get("recv_name"), r.get("recv_fatf"),
+             amt, score, fraud, ftype, ttype, "receiver")
+        if r.get("bene_cc"):
+            _add(r["bene_cc"], r["bene_cc"], "HIGH",
+                 amt, score, fraud, ftype, ttype, "beneficiary")
+
+    result = []
+    for s in country_stats.values():
+        scores = s["scores"]
+        avg_score = round(sum(scores) / len(scores)) if scores else None
+        max_score = max(scores) if scores else None
+        fraud_pct = s["fraud_count"] / s["txn_count"] if s["txn_count"] else 0
+        if max_score is not None and max_score >= 700:
+            risk_level = "CRITICAL"
+        elif max_score is not None and max_score >= 400:
+            risk_level = "HIGH"
+        elif fraud_pct > 0:
+            risk_level = "MEDIUM"
+        else:
+            risk_level = "LOW"
+        result.append({
+            "code": s["code"], "name": s["name"],
+            "fatf_risk": s["fatf_risk"],
+            "txn_count": s["txn_count"],
+            "fraud_count": s["fraud_count"],
+            "total_amount": round(s["total_amount"], 2),
+            "avg_score": avg_score, "max_score": max_score,
+            "risk_level": risk_level,
+            "directions": list(s["directions"]),
+            "fraud_types": list(s["fraud_types"]),
+            "txn_types": list(s["txn_types"]),
+        })
+
+    result.sort(key=lambda x: x["txn_count"], reverse=True)
+
+    # Summary stats (no PII)
+    total_txns = sum(r["txn_count"] for r in result)
+    total_fraud = sum(r["fraud_count"] for r in result)
+    return {
+        "countries": result,
+        "total_countries": len(result),
+        "summary": {
+            "total_transactions": total_txns,
+            "total_fraud": total_fraud,
+            "fraud_rate_pct": round(total_fraud / max(total_txns, 1) * 100, 1),
+            "high_risk_countries": sum(1 for r in result if r["risk_level"] in ("HIGH", "CRITICAL")),
+        },
     }
 
 

@@ -193,7 +193,37 @@ export interface RiskFactor {
   avg_score_when_triggered: number
 }
 
+// ── Auth types ──────────────────────────────────────────────────────────
+
+export interface AuthUser {
+  id: string
+  username: string
+  role: 'admin' | 'viewer'
+  full_name?: string
+  is_active: boolean
+}
+
+export interface AggregateWorldMapEntry {
+  code: string
+  name: string
+  fatf_risk: string
+  txn_count: number
+  fraud_count: number
+  total_amount: number
+  avg_score: number | null
+  max_score: number | null
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  directions: string[]
+  fraud_types: string[]
+  txn_types: string[]
+}
+
 // ── API calls ───────────────────────────────────────────────────────────
+
+export const getAggregateWorldMap = () =>
+  api.get<{ countries: AggregateWorldMapEntry[]; total_countries: number; summary: Record<string, number> }>(
+    '/transactions/aggregate/world-map'
+  ).then(r => r.data)
 
 export const submitTransaction = (data: object) =>
   api.post<EvaluationResponse>('/submit/transaction', data).then(r => r.data)
