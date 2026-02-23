@@ -279,6 +279,23 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
+    # ── Log prediction for drift monitoring ──────────────────────
+    try:
+        from monitoring.logger import log_prediction
+        log_prediction(
+            transaction_id=txn_id,
+            bayesian_score=bayesian_score,
+            ml_score=ml_score,
+            final_score=final_score,
+            outcome=outcome.value,
+            risk_factors=bayes_result.triggered_factors,
+            feature_vector=fv.to_ml_array(),
+            confidence=round(confidence, 4),
+            processing_time_ms=round(elapsed_ms, 2),
+        )
+    except Exception:
+        pass
+
     return {
         "transaction_id": txn_id,
         "risk_score": risk_score,
@@ -329,6 +346,22 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
         challenge_question = _generate_challenge(txn_id, txn_data)
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    try:
+        from monitoring.logger import log_prediction
+        log_prediction(
+            transaction_id=txn_id,
+            bayesian_score=bayesian_score,
+            ml_score=ml_score,
+            final_score=final_score,
+            outcome=outcome.value,
+            risk_factors=bayes_result.triggered_factors,
+            feature_vector=fv.to_ml_array(),
+            confidence=round(confidence, 4),
+            processing_time_ms=round(elapsed_ms, 2),
+        )
+    except Exception:
+        pass
 
     return {
         "transaction_id": txn_id,

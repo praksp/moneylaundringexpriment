@@ -156,6 +156,25 @@ def train_and_save() -> AMLModel:
 
     console.print("[cyan]Saving model...[/]")
     model.save()
+
+    # Save training metadata for drift detection reference
+    import json, random
+    from pathlib import Path
+    from config.settings import settings
+    meta_path = Path(settings.model_path).parent / "training_metadata.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    # Sample up to 500 vectors to keep file small
+    sample_size = min(500, len(X))
+    idx = random.sample(range(len(X)), sample_size)
+    training_scores = [round(float(p) * 999) for p in model.predict_proba_batch(X[idx])]
+    with open(meta_path, "w") as f:
+        json.dump({
+            "training_scores": training_scores,
+            "training_vectors_sample": X[idx].tolist(),
+            "feature_names": FeatureVector.feature_names(),
+            "n_samples": int(len(X)),
+            "fraud_rate": float(y.mean()),
+        }, f)
     console.print("[bold green]✓ Model saved[/]")
 
     return model
