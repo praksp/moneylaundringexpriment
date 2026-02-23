@@ -251,6 +251,25 @@ export const listCustomers = (skip = 0, limit = 20, riskTier?: string) =>
 export const getHighRiskAccounts = () =>
   api.get('/profiles/high-risk-accounts').then(r => r.data)
 
+export interface PagedTransactions {
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  transactions: TransactionSummary[]
+}
+
+export const getCustomerTransactions = (
+  customerId: string,
+  page = 1,
+  pageSize = 500,
+) =>
+  api
+    .get<PagedTransactions>(`/profiles/${customerId}/transactions`, {
+      params: { page, page_size: pageSize },
+    })
+    .then(r => r.data)
+
 export const computeFeatureSnapshot = (customerId: string, accountId: string) =>
   api.post(`/profiles/${customerId}/accounts/${accountId}/feature-snapshot`).then(r => r.data)
 

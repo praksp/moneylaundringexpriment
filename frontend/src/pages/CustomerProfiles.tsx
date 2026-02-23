@@ -1,14 +1,14 @@
 import { useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, keepPreviousData } from '@tanstack/react-query'
 import {
   Search, User, AlertTriangle, TrendingUp, TrendingDown, Minus,
   Shield, ChevronRight, X, ArrowRight, Monitor, Wifi, MapPin,
   Clock, Hash, Building2, CreditCard, ChevronDown, ChevronUp,
-  ExternalLink, Info,
+  ExternalLink, Info, ChevronLeft, Layers,
 } from 'lucide-react'
 import {
   listCustomers, getCustomerProfile, computeFeatureSnapshot,
-  getTransactionDetail,
+  getTransactionDetail, getCustomerTransactions,
   type CustomerProfile, type TransactionSummary, type RiskFactorDetail,
 } from '../api/client'
 import TransactionWorldMap from '../components/TransactionWorldMap'
@@ -508,6 +508,168 @@ function TransactionRow({ txn, onClick }: { txn: TransactionSummary; onClick: ()
   )
 }
 
+// ── Paginated transaction list ────────────────────────────────────────────────
+
+const PAGE_SIZE = 500
+
+function PaginatedTransactionList({
+  customerId,
+  onTransactionClick,
+}: {
+  customerId: string
+  onTransactionClick: (txn: TransactionSummary) => void
+}) {
+  const [page, setPage] = useState(1)
+
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: ['customer-txns', customerId, page] as [string, string, number],
+    queryFn: () => getCustomerTransactions(customerId, page, PAGE_SIZE),
+    placeholderData: keepPreviousData,
+  })
+
+  const totalPages  = data?.total_pages ?? 1
+  const total       = data?.total       ?? 0
+  const txns        = data?.transactions ?? []
+
+  const rangeStart  = data ? (page - 1) * PAGE_SIZE + 1 : 0
+  const rangeEnd    = data ? Math.min(page * PAGE_SIZE, total) : 0
+
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 p-5">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-slate-300">Transaction History</h3>
+          <span className="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full">
+            {total.toLocaleString()} total
+          </span>
+          {isFetching && !isLoading && (
+            <div className="w-3 h-3 border border-blue-500/40 border-t-blue-400 rounded-full animate-spin" />
+          )}
+        </div>
+        <span className="text-xs text-slate-500">Click any row for risk details</span>
+      </div>
+
+      {/* Pagination controls — top */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between mb-3 bg-slate-800/60 rounded-lg px-3 py-2">
+          <div className="flex items-center gap-1.5 text-xs text-slate-400">
+            <Layers size={12} className="text-slate-500" />
+            Showing {rangeStart.toLocaleString()}–{rangeEnd.toLocaleString()} of{' '}
+            {total.toLocaleString()} transactions
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(1)}
+              disabled={page === 1}
+              className="p-1 rounded hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-400"
+              title="First page"
+            >
+              <ChevronLeft size={13} />
+            </button>
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="px-2.5 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300"
+            >
+              Prev
+            </button>
+
+            {/* Page number pills */}
+            <div className="flex items-center gap-0.5">
+              {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+                let p: number
+                if (totalPages <= 7) {
+                  p = i + 1
+                } else if (page <= 4) {
+                  p = i < 6 ? i + 1 : totalPages
+                } else if (page >= totalPages - 3) {
+                  p = i === 0 ? 1 : totalPages - 6 + i
+                } else {
+                  const offsets = [-3, -2, -1, 0, 1, 2]
+                  p = i === 0 ? 1 : i < 6 ? page + offsets[i] : totalPages
+                }
+                return (
+                  <button
+                    key={p}
+                    onClick={() => setPage(p)}
+                    className={clsx(
+                      'w-7 h-6 rounded text-xs font-medium transition-colors',
+                      page === p
+                        ? 'bg-blue-600 text-white'
+                        : 'text-slate-400 hover:bg-slate-700 hover:text-slate-200',
+                    )}
+                  >
+                    {p}
+                  </button>
+                )
+              })}
+            </div>
+
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="px-2.5 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300"
+            >
+              Next
+            </button>
+            <button
+              onClick={() => setPage(totalPages)}
+              disabled={page === totalPages}
+              className="p-1 rounded hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed text-slate-400"
+              title="Last page"
+            >
+              <ChevronRight size={13} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Transaction rows */}
+      <div className="space-y-1.5 max-h-[420px] overflow-y-auto">
+        {isLoading ? (
+          <div className="flex items-center justify-center py-10 gap-2 text-slate-500 text-sm">
+            <div className="w-4 h-4 border border-blue-500/40 border-t-blue-400 rounded-full animate-spin" />
+            Loading transactions…
+          </div>
+        ) : txns.length === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-6">No transactions found</p>
+        ) : (
+          txns.map((t: TransactionSummary) => (
+            <TransactionRow key={t.id} txn={t} onClick={() => onTransactionClick(t)} />
+          ))
+        )}
+      </div>
+
+      {/* Pagination controls — bottom (repeated for long lists) */}
+      {totalPages > 1 && !isLoading && (
+        <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-800">
+          <span className="text-xs text-slate-500">
+            Page {page} of {totalPages}  ·  {PAGE_SIZE} per page
+          </span>
+          <div className="flex gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page === 1}
+              className="px-3 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 flex items-center gap-1"
+            >
+              <ChevronLeft size={12} /> Prev
+            </button>
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page === totalPages}
+              className="px-3 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 flex items-center gap-1"
+            >
+              Next <ChevronRight size={12} />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 // ── Profile panel ─────────────────────────────────────────────────────────────
 
 function ProfilePanel({ profile, onTransactionClick }: {
@@ -677,28 +839,11 @@ function ProfilePanel({ profile, onTransactionClick }: {
         </div>
       </div>
 
-      {/* Transaction history — clickable */}
-      <div className="bg-slate-900 rounded-xl border border-slate-800 p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-semibold text-slate-300">
-            Transaction History ({profile.recent_transactions.length})
-          </h3>
-          <span className="text-xs text-slate-500">Click any row for risk details</span>
-        </div>
-        <div className="space-y-1.5 max-h-96 overflow-y-auto">
-          {profile.recent_transactions.length === 0 ? (
-            <p className="text-xs text-slate-500 text-center py-6">No transactions in last 30 days</p>
-          ) : (
-            profile.recent_transactions.map(t => (
-              <TransactionRow
-                key={t.id}
-                txn={t}
-                onClick={() => onTransactionClick(t)}
-              />
-            ))
-          )}
-        </div>
-      </div>
+      {/* Transaction history — paginated */}
+      <PaginatedTransactionList
+        customerId={profile.customer_id}
+        onTransactionClick={onTransactionClick}
+      />
 
       {/* Network connections */}
       {profile.network_connections.length > 0 && (

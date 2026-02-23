@@ -7,7 +7,9 @@ is only visible to admins.  Viewer-role users are directed to the
 /transactions/aggregate endpoint instead.
 """
 from fastapi import APIRouter, HTTPException, Query, Depends
-from profiles.customer_profile import build_customer_profile, list_customers
+from profiles.customer_profile import (
+    build_customer_profile, list_customers, get_customer_transactions_page,
+)
 from store.feature_store import (
     compute_and_store_feature_snapshot, get_latest_snapshot,
     list_high_risk_accounts,
@@ -380,6 +382,28 @@ async def get_transaction_map(
 
     result.sort(key=lambda x: x["txn_count"], reverse=True)
     return {"countries": result, "total_countries": len(result)}
+
+
+@router.get("/{customer_id}/transactions")
+async def list_customer_transactions(
+    customer_id: str,
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=500, ge=1, le=500, description="Transactions per page (max 500)"),
+    _admin: UserInDB = Depends(require_admin),
+):
+    """
+    Paginated transaction history for a customer.
+    Returns 500 transactions per page by default, ordered newest-first.
+    """
+    result = get_customer_transactions_page(customer_id, page=page, page_size=page_size)
+    if result["total"] == 0:
+        # Verify the customer actually exists before returning an empty result
+        from profiles.customer_profile import CUSTOMER_BASE_QUERY
+        from db.client import neo4j_session
+        with neo4j_session() as s:
+            if s.run(CUSTOMER_BASE_QUERY, customer_id=customer_id).single() is None:
+                raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+    return result
 
 
 @router.get("/{customer_id}/transactions/{txn_id}")

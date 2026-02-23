@@ -45,6 +45,25 @@ ORDER BY t.timestamp DESC
 LIMIT $limit
 """
 
+TXN_COUNT_QUERY = """
+MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
+MATCH (a)-[:INITIATED]->(t:Transaction)
+RETURN count(t) AS total
+"""
+
+TRANSACTION_HISTORY_PAGINATED_QUERY = """
+MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
+MATCH (a)-[:INITIATED]->(t:Transaction)
+OPTIONAL MATCH (t)-[:CREDITED_TO]->(recv:Account)
+OPTIONAL MATCH (recv)<-[:OWNS]-(recv_c:Customer)
+OPTIONAL MATCH (t)-[:HAS_PREDICTION]->(pl:PredictionLog)
+RETURN t, a.id AS sender_account_id, recv.id AS receiver_account_id,
+       recv_c.name AS receiver_name, pl
+ORDER BY t.timestamp DESC
+SKIP $skip
+LIMIT $limit
+"""
+
 RISK_HISTORY_QUERY = """
 MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
 MATCH (a)-[:INITIATED]->(t:Transaction)
@@ -240,51 +259,7 @@ def build_customer_profile(customer_id: str, txn_limit: int = 30) -> Optional[Cu
             TRANSACTION_HISTORY_QUERY,
             customer_id=customer_id, limit=txn_limit
         ))
-        transactions = []
-        _FRAUD_SCORE_MAP = {
-            "STRUCTURING": (720, "DECLINE", ["is_structuring", "in_structuring_band"]),
-            "SMURFING": (700, "DECLINE", ["is_structuring", "is_high_velocity_24h"]),
-            "LAYERING": (750, "DECLINE", ["is_deep_layering", "is_cross_border"]),
-            "ROUND_TRIP": (710, "DECLINE", ["is_round_trip"]),
-            "DORMANT_BURST": (680, "CHALLENGE", ["is_dormant_sender", "high_amount_deviation"]),
-            "HIGH_RISK_CORRIDOR": (730, "DECLINE", ["sender_to_high_risk", "is_cross_border", "beneficiary_country_risk"]),
-            "RAPID_VELOCITY": (760, "DECLINE", ["is_high_velocity_1h", "is_high_velocity_24h"]),
-        }
-        for r in txn_records:
-            t = _node(r["t"])
-            pl = _node(r["pl"]) if r.get("pl") else None
-            fraud_type = t.get("fraud_type")
-            is_fraud = bool(t.get("is_fraud", False))
-
-            if pl:
-                risk_score = int(pl.get("final_score", 0))
-                outcome = pl.get("outcome")
-                risk_factors = list(pl.get("risk_factors", []))
-            elif is_fraud and fraud_type and fraud_type in _FRAUD_SCORE_MAP:
-                # Use known fraud-pattern defaults for test data with no evaluation log
-                risk_score, outcome, risk_factors = _FRAUD_SCORE_MAP[fraud_type]
-            else:
-                risk_score = None
-                outcome = None
-                risk_factors = []
-
-            transactions.append(TransactionSummary(
-                id=t.get("id", ""),
-                reference=t.get("reference", ""),
-                amount=float(t.get("amount", 0)),
-                currency=t.get("currency", "USD"),
-                transaction_type=t.get("transaction_type", ""),
-                channel=t.get("channel", ""),
-                timestamp=str(t.get("timestamp", "")),
-                is_fraud=is_fraud,
-                fraud_type=fraud_type,
-                sender_account_id=str(r.get("sender_account_id", "")),
-                receiver_account_id=str(r.get("receiver_account_id", "")) if r.get("receiver_account_id") else None,
-                receiver_name=r.get("receiver_name"),
-                risk_score=risk_score,
-                outcome=outcome,
-                risk_factors=risk_factors,
-            ))
+        transactions = _build_transactions_from_records(txn_records)
 
         # ── Risk history — derived from transactions (incl. test-data fraud labels) ──
         scores = [t.risk_score for t in transactions if t.risk_score is not None]
@@ -469,6 +444,93 @@ def _compute_mule_indicators(customer_id: str, accounts: list, velocity: dict,
     indicators["is_likely_mule"] = mule_score >= 50
 
     return indicators
+
+
+def _build_transactions_from_records(records: list) -> list[TransactionSummary]:
+    """Convert raw Neo4j query records into TransactionSummary objects."""
+    _FRAUD_SCORE_MAP = {
+        "STRUCTURING":       (720, "DECLINE",   ["is_structuring", "in_structuring_band"]),
+        "SMURFING":          (700, "DECLINE",   ["is_structuring", "is_high_velocity_24h"]),
+        "LAYERING":          (750, "DECLINE",   ["is_deep_layering", "is_cross_border"]),
+        "ROUND_TRIP":        (710, "DECLINE",   ["is_round_trip"]),
+        "DORMANT_BURST":     (680, "CHALLENGE", ["is_dormant_sender", "high_amount_deviation"]),
+        "HIGH_RISK_CORRIDOR":(730, "DECLINE",   ["sender_to_high_risk", "is_cross_border", "beneficiary_country_risk"]),
+        "RAPID_VELOCITY":    (760, "DECLINE",   ["is_high_velocity_1h", "is_high_velocity_24h"]),
+    }
+    results = []
+    for r in records:
+        t = _node(r["t"])
+        pl = _node(r["pl"]) if r.get("pl") else None
+        fraud_type = t.get("fraud_type")
+        is_fraud = bool(t.get("is_fraud", False))
+
+        if pl:
+            risk_score   = int(pl.get("final_score", 0))
+            outcome      = pl.get("outcome")
+            risk_factors = list(pl.get("risk_factors", []))
+        elif is_fraud and fraud_type and fraud_type in _FRAUD_SCORE_MAP:
+            risk_score, outcome, risk_factors = _FRAUD_SCORE_MAP[fraud_type]
+        else:
+            risk_score   = None
+            outcome      = None
+            risk_factors = []
+
+        results.append(TransactionSummary(
+            id=t.get("id", ""),
+            reference=t.get("reference", ""),
+            amount=float(t.get("amount", 0)),
+            currency=t.get("currency", "USD"),
+            transaction_type=t.get("transaction_type", ""),
+            channel=t.get("channel", ""),
+            timestamp=str(t.get("timestamp", "")),
+            is_fraud=is_fraud,
+            fraud_type=fraud_type,
+            sender_account_id=str(r.get("sender_account_id", "")),
+            receiver_account_id=(
+                str(r.get("receiver_account_id", "")) if r.get("receiver_account_id") else None
+            ),
+            receiver_name=r.get("receiver_name"),
+            risk_score=risk_score,
+            outcome=outcome,
+            risk_factors=risk_factors,
+        ))
+    return results
+
+
+def get_customer_transactions_page(
+    customer_id: str,
+    page: int = 1,
+    page_size: int = 500,
+) -> dict:
+    """
+    Return a single page of a customer's transactions, ordered by timestamp DESC.
+    Response shape:
+      { total, page, page_size, total_pages, transactions: [TransactionSummary] }
+    """
+    import dataclasses
+    skip = (page - 1) * page_size
+
+    with neo4j_session() as session:
+        total_rec = session.run(TXN_COUNT_QUERY, customer_id=customer_id).single()
+        total = int(total_rec["total"]) if total_rec else 0
+
+        txn_records = list(session.run(
+            TRANSACTION_HISTORY_PAGINATED_QUERY,
+            customer_id=customer_id,
+            skip=skip,
+            limit=page_size,
+        ))
+
+    transactions = _build_transactions_from_records(txn_records)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    return {
+        "total":       total,
+        "page":        page,
+        "page_size":   page_size,
+        "total_pages": total_pages,
+        "transactions": [dataclasses.asdict(t) for t in transactions],
+    }
 
 
 def list_customers(skip: int = 0, limit: int = 20, risk_tier: str = None) -> dict:
