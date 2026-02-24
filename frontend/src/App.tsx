@@ -10,6 +10,7 @@ import FeatureStore from './pages/FeatureStore'
 import ModelMonitor from './pages/ModelMonitor'
 import Overview from './pages/Overview'
 import AnomalyDetection from './pages/AnomalyDetection'
+import GraphSAGEDetection from './pages/GraphSAGEDetection'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -74,6 +75,10 @@ function AppRoutes() {
         <Route
           path="anomaly"
           element={<RequireAdmin><AnomalyDetection /></RequireAdmin>}
+        />
+        <Route
+          path="graphsage"
+          element={<RequireAdmin><GraphSAGEDetection /></RequireAdmin>}
         />
       </Route>
 

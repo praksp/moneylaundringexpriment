@@ -2,7 +2,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import {
   ShieldAlert, Send, Users, Activity,
   Database, BarChart3, Globe, LogOut, ChevronDown,
-  Shield, Eye, ScanSearch,
+  Shield, Eye, ScanSearch, Network,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useState } from 'react'
@@ -22,6 +22,7 @@ export default function Layout() {
     // Admin-only
     { to: '/customers', label: 'Customer Profiles', icon: Users, roles: ['admin'] },
     { to: '/anomaly',   label: 'Anomaly Detection', icon: ScanSearch, roles: ['admin'] },
+    { to: '/graphsage', label: 'GraphSAGE Mule',    icon: Network,   roles: ['admin'] },
     { to: '/features',  label: 'Feature Store', icon: Database, roles: ['admin'] },
     { to: '/monitor',   label: 'Model Monitor', icon: Activity, roles: ['admin', 'viewer'] },
   ]

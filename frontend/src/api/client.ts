@@ -426,3 +426,89 @@ export const trainAnomalyDetector = () =>
 
 export const scanAccounts = (force = false) =>
   api.post('/anomaly/scan', null, { params: { force } }).then(r => r.data)
+
+// ── GraphSAGE Mule Detection ─────────────────────────────────────────────────
+
+export interface GraphSAGESuspect {
+  account_id: string
+  graphsage_score: number        // 0–100
+  is_suspect: boolean
+  customer_id: string | null
+  customer_name: string | null
+  customer_country: string | null
+  account_number: string | null
+  bank_name: string | null
+  account_type: string | null
+  scored_at: string | null
+  knn_anomaly_score: number | null
+}
+
+export interface GraphSAGESuspectPage {
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  suspects: GraphSAGESuspect[]
+  model_trained: boolean
+  training_stats: Record<string, unknown>
+}
+
+export interface GraphSAGESummary {
+  model_trained: boolean
+  training_stats: Record<string, unknown>
+  total_accounts: number
+  scored_accounts: number
+  graphsage_suspects: number
+  high_confidence: number
+  flagged_by_both: number
+  coverage_pct: number
+  feature_flag_on: boolean
+}
+
+export interface GraphSAGEAccountDetail {
+  account_id: string
+  graphsage_score: number
+  is_suspect: boolean
+  scored_at: string | null
+  knn_anomaly_score: number | null
+  knn_suspect: boolean
+  flagged_by_both: boolean
+  account_number: string | null
+  bank_name: string | null
+  account_type: string | null
+  customer_id: string | null
+  customer_name: string | null
+  customer_country: string | null
+}
+
+export interface GraphSAGEComparison {
+  accounts: {
+    account_id: string
+    account_number: string | null
+    sage_score: number
+    knn_score: number
+    sage_suspect: boolean
+    knn_suspect: boolean
+    customer_name: string | null
+    country: string | null
+  }[]
+  total: number
+  agreement_pct: number
+}
+
+export const getGraphSAGESummary = () =>
+  api.get<GraphSAGESummary>('/graphsage/summary').then(r => r.data)
+
+export const listGraphSAGESuspects = (page = 1, pageSize = 50) =>
+  api.get<GraphSAGESuspectPage>('/graphsage/suspects', {
+    params: { page, page_size: pageSize },
+  }).then(r => r.data)
+
+export const getGraphSAGEAccount = (accountId: string) =>
+  api.get<GraphSAGEAccountDetail>(`/graphsage/accounts/${accountId}`).then(r => r.data)
+
+export const getGraphSAGEComparison = (limit = 200) =>
+  api.get<GraphSAGEComparison>('/graphsage/comparison', { params: { limit } }).then(r => r.data)
+
+export const trainGraphSAGE = (params?: { max_nodes?: number; max_edges?: number; epochs?: number }) =>
+  api.post('/graphsage/train', null, { params }).then(r => r.data)

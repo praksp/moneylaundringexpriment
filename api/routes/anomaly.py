@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from auth.dependencies import require_admin
 from db.client import neo4j_session
 from ml.anomaly import get_detector, reset_detector
+from ml.anomaly import MuleAccountDetector as _MAD   # re-export for _train_and_scan
 
 router = APIRouter(prefix="/anomaly", tags=["Anomaly Detection"])
 

@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     model_path: str = Field(default="models_saved/aml_model.joblib", alias="MODEL_PATH")
     scaler_path: str = Field(default="models_saved/aml_scaler.joblib", alias="SCALER_PATH")
 
+    # ── Feature flags ──────────────────────────────────────────────────────────
+    # Enable KNN (FAISS) anomaly detector training and inference.
+    # Disable on memory-constrained machines or when GraphSAGE is preferred.
+    enable_knn_anomaly: bool = Field(default=True, alias="ENABLE_KNN_ANOMALY")
+
+    # Enable GraphSAGE mule-account detection.
+    enable_graphsage: bool = Field(default=True, alias="ENABLE_GRAPHSAGE")
+
     model_config = {"env_file": ".env", "populate_by_name": True}
 
     @property

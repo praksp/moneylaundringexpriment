@@ -26,9 +26,11 @@ from api.routes.monitoring import router as monitoring_router
 from api.routes.submit import router as submit_router
 from api.routes.auth import router as auth_router
 from api.routes.anomaly import router as anomaly_router
+from api.routes.graphsage import router as graphsage_router
 from db.client import get_driver, close_driver
 from ml.model import get_model, get_registry
 from ml.anomaly import get_detector
+from config.settings import settings
 from monitoring.logger import ensure_schema
 from auth.security import seed_default_users
 from config.settings import settings
@@ -40,7 +42,11 @@ async def lifespan(app: FastAPI):
     get_driver()            # Verify Neo4j connectivity
     get_model()             # Pre-load XGBoost (legacy)
     get_registry()          # Pre-load risk models (XGBoost + SVM)
-    get_detector()          # Pre-load KNN anomaly detector
+    if settings.enable_knn_anomaly:
+        get_detector()      # Pre-load KNN anomaly detector (feature-flagged)
+    if settings.enable_graphsage:
+        from ml.graphsage import get_sage
+        get_sage()          # Pre-load GraphSAGE weights if saved
     ensure_schema()         # Prediction log constraints
     seed_default_users()    # Create admin/viewer users if not present
     yield
@@ -73,6 +79,7 @@ app.include_router(eval_router)
 app.include_router(profiles_router)
 app.include_router(monitoring_router)
 app.include_router(anomaly_router)
+app.include_router(graphsage_router)
 
 
 @app.get("/health", tags=["System"])
@@ -89,10 +96,13 @@ async def health_check():
 
     registry = get_registry()
     detector = get_detector()
+    from ml.graphsage import get_sage
+    sage_model = get_sage()
     models_status = {
-        "xgboost": registry.xgb.is_trained,
-        "svm":     registry.svm.is_trained,
-        "anomaly_detector": detector.is_trained,
+        "xgboost":           registry.xgb.is_trained,
+        "svm":               registry.svm.is_trained,
+        "knn_anomaly":       detector.is_trained,
+        "graphsage":         sage_model.is_trained,
     }
     all_models_ok = any([registry.xgb.is_trained, registry.svm.is_trained])
 

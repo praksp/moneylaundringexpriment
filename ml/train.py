@@ -29,7 +29,7 @@ from rich.table import Table
 from db.client import neo4j_session
 from risk.features import extract_features, FeatureVector
 from ml.model import AMLModel, SVMModel, reset_registry
-from ml.anomaly import MuleAccountDetector, reset_detector
+from config.settings import settings
 
 console = Console()
 
@@ -227,18 +227,41 @@ def train_and_save_all() -> dict:
     all_metrics["svm"] = {k: v for k, v in m.items() if k != "classification_report"}
     console.print("[bold green]✓ SGD/SVM saved[/]")
 
-    # ── KNN Anomaly Detector (self-loads a sample of normal txns) ────────────
-    console.print("\n[bold cyan]━━━ Training KNN Mule-Account Anomaly Detector ━━━[/]")
-    detector = MuleAccountDetector()
-    m_anom = detector.fit()   # loads its own data — avoids duplicating the 1GB X array
-    detector.save()
-    reset_detector()
-    all_metrics["anomaly"] = m_anom
-    console.print(
-        f"  Normal vectors indexed: {m_anom['n_normal_vectors']:,}  "
-        f"| p95 dist: {m_anom['p95_dist']}"
-    )
-    console.print("[bold green]✓ Anomaly detector saved[/]")
+    # ── KNN Anomaly Detector (feature-flagged) ────────────────────────────────
+    if settings.enable_knn_anomaly:
+        from ml.anomaly import MuleAccountDetector, reset_detector
+        console.print("\n[bold cyan]━━━ Training KNN Mule-Account Anomaly Detector ━━━[/]")
+        detector = MuleAccountDetector()
+        m_anom = detector.fit()   # loads its own data — avoids 1 GB X duplication
+        detector.save()
+        reset_detector()
+        all_metrics["anomaly"] = m_anom
+        console.print(
+            f"  Normal vectors indexed: {m_anom['n_normal_vectors']:,}  "
+            f"| p95 dist: {m_anom['p95_dist']}"
+        )
+        console.print("[bold green]✓ KNN Anomaly detector saved[/]")
+    else:
+        console.print("\n[yellow]⚡ KNN anomaly detector skipped (ENABLE_KNN_ANOMALY=false)[/]")
+
+    # ── GraphSAGE Mule-Account Detector (feature-flagged) ─────────────────────
+    if settings.enable_graphsage:
+        from ml.graphsage import train_graphsage, reset_sage
+        console.print("\n[bold cyan]━━━ Training GraphSAGE Mule-Account Detector ━━━[/]")
+        try:
+            sage_metrics = train_graphsage(max_nodes=50_000, max_edges=500_000, epochs=60)
+            all_metrics["graphsage"] = sage_metrics
+            reset_sage()
+            console.print(
+                f"  ROC-AUC: {sage_metrics['roc_auc']} "
+                f"| Avg Precision: {sage_metrics['avg_precision']}"
+            )
+            console.print("[bold green]✓ GraphSAGE model saved[/]")
+        except Exception as exc:
+            console.print(f"[yellow]⚠ GraphSAGE training failed: {exc}[/]")
+            all_metrics["graphsage"] = {"error": str(exc)}
+    else:
+        console.print("\n[yellow]⚡ GraphSAGE skipped (ENABLE_GRAPHSAGE=false)[/]")
 
     # ── Metadata for drift detection ──────────────────────────────────────────
     _save_training_metadata(X, y, xgb, all_metrics)
