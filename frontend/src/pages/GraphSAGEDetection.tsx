@@ -3,12 +3,14 @@ import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tansta
 import {
   Brain, Network, RefreshCw, AlertTriangle, ShieldCheck,
   ChevronLeft, ChevronRight, TrendingUp, BarChart3, GitCompare,
-  Zap, Info, CheckCircle2, XCircle,
+  Zap, Info, CheckCircle2, XCircle, ArrowUpRight, ArrowDownLeft,
+  ShieldAlert, Activity,
 } from 'lucide-react'
 import {
   getGraphSAGESummary, listGraphSAGESuspects, getGraphSAGEComparison, trainGraphSAGE,
+  getGraphSAGEAccount,
 } from '../api/client'
-import type { GraphSAGESuspect, GraphSAGESummary } from '../api/client'
+import type { GraphSAGESuspect, GraphSAGESummary, GraphSAGEAccountDetail } from '../api/client'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -26,22 +28,6 @@ function scoreBg(score: number) {
   return 'bg-green-900/40 border-green-700/40'
 }
 
-function ScoreBar({ score, label }: { score: number; label: string }) {
-  const pct = Math.min(100, Math.max(0, score))
-  const color = score >= 75 ? 'bg-red-500' : score >= 50 ? 'bg-orange-500' : score >= 30 ? 'bg-yellow-500' : 'bg-green-500'
-  return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs text-slate-400">
-        <span>{label}</span>
-        <span className={scoreColor(score)}>{score.toFixed(1)}</span>
-      </div>
-      <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-        <div className={`h-2 rounded-full transition-all ${color}`} style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  )
-}
-
 function StatCard({ label, value, sub, color = 'text-white' }: {
   label: string; value: string | number; sub?: string; color?: string
 }) {
@@ -50,6 +36,44 @@ function StatCard({ label, value, sub, color = 'text-white' }: {
       <p className="text-sm text-slate-400">{label}</p>
       <p className={`text-3xl font-bold mt-1 ${color}`}>{value}</p>
       {sub && <p className="text-xs text-slate-500 mt-1">{sub}</p>}
+    </div>
+  )
+}
+
+// ── Feature bar ───────────────────────────────────────────────────────────────
+
+function FeatureRow({ feat }: { feat: GraphSAGEAccountDetail['features'][0] }) {
+  const pct = typeof feat.value === 'number'
+    ? Math.min(100, (feat.value / (Number(feat.threshold) || 100)) * 100)
+    : feat.triggered ? 100 : 0
+
+  return (
+    <div className={`rounded-lg border p-3 space-y-1.5 ${feat.triggered
+      ? 'bg-red-900/20 border-red-700/40'
+      : 'bg-slate-800/40 border-slate-700/30'}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-1.5 min-w-0">
+          {feat.triggered
+            ? <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+            : <CheckCircle2  className="w-3.5 h-3.5 text-slate-600 shrink-0" />}
+          <span className={`text-xs font-medium truncate ${feat.triggered ? 'text-red-200' : 'text-slate-400'}`}>
+            {feat.name}
+          </span>
+        </div>
+        <div className="text-right shrink-0">
+          <span className={`text-sm font-bold ${feat.triggered ? 'text-red-300' : 'text-slate-400'}`}>
+            {String(feat.value)}{feat.unit}
+          </span>
+          <span className="text-slate-600 text-xs ml-1">/ {String(feat.threshold)}{feat.unit}</span>
+        </div>
+      </div>
+      <div className="h-1.5 bg-slate-700/60 rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full transition-all ${feat.triggered ? 'bg-red-500' : 'bg-slate-600'}`}
+          style={{ width: `${Math.min(100, pct)}%` }}
+        />
+      </div>
+      <p className="text-[10px] text-slate-500">{feat.description}</p>
     </div>
   )
 }
@@ -63,76 +87,210 @@ function AccountDrawer({
   account: GraphSAGESuspect
   onClose: () => void
 }) {
+  const [activeTab, setActiveTab] = useState<'features' | 'transactions'>('features')
+
+  const { data: detail, isLoading } = useQuery<GraphSAGEAccountDetail>({
+    queryKey: ['graphsage-account-detail', account.account_id],
+    queryFn: () => getGraphSAGEAccount(account.account_id),
+    staleTime: 60_000,
+  })
+
   const sage = account.graphsage_score
   const knn  = account.knn_anomaly_score ?? 0
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-end bg-black/60" onClick={onClose}>
       <div
-        className="h-full w-full max-w-md bg-slate-900 border-l border-slate-700 overflow-y-auto shadow-2xl"
+        className="h-full w-full max-w-2xl bg-slate-900 border-l border-slate-700 overflow-y-auto shadow-2xl flex flex-col"
         onClick={e => e.stopPropagation()}
       >
-        <div className="p-5 border-b border-slate-700 flex items-center justify-between">
+        {/* Header */}
+        <div className="p-5 border-b border-slate-700 flex items-start justify-between shrink-0">
           <div>
-            <h3 className="font-semibold text-white">Account Detail</h3>
-            <p className="text-xs text-slate-400">{account.account_number ?? account.account_id}</p>
+            <h3 className="font-semibold text-white flex items-center gap-2">
+              <Network className="w-4 h-4 text-purple-400" />
+              Mule Account Analysis
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {account.account_number ?? account.account_id}
+              {account.bank_name && <span className="ml-2 text-slate-500">· {account.bank_name}</span>}
+            </p>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-xl">✕</button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-xl shrink-0">✕</button>
         </div>
 
-        <div className="p-5 space-y-5">
-          {/* Score comparison */}
-          <div className={`border rounded-xl p-4 space-y-3 ${scoreBg(sage)}`}>
-            <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Detection Scores</p>
-            <ScoreBar score={sage} label="GraphSAGE Mule Score" />
+        {/* Score banner */}
+        <div className={`p-4 border-b border-slate-700/50 ${scoreBg(sage)}`}>
+          <div className="flex items-center gap-4">
+            <div className="text-center">
+              <p className={`text-3xl font-bold ${scoreColor(sage)}`}>{sage.toFixed(0)}</p>
+              <p className="text-xs text-slate-400">SAGE score</p>
+            </div>
             {account.knn_anomaly_score != null && (
-              <ScoreBar score={knn} label="KNN Anomaly Score" />
-            )}
-            {account.knn_anomaly_score != null && (
-              <div className="mt-2 pt-2 border-t border-slate-600/50">
-                <div className="flex items-center gap-2 text-xs">
-                  {sage >= 50 && knn >= 50
-                    ? <><AlertTriangle className="w-3.5 h-3.5 text-red-400" /><span className="text-red-300">Flagged by BOTH models — high confidence mule</span></>
-                    : sage >= 50
-                    ? <><Info className="w-3.5 h-3.5 text-orange-400" /><span className="text-orange-300">GraphSAGE flags — verify with KNN</span></>
-                    : knn >= 50
-                    ? <><Info className="w-3.5 h-3.5 text-yellow-400" /><span className="text-yellow-300">KNN flags — check graph neighbourhood</span></>
-                    : <><CheckCircle2 className="w-3.5 h-3.5 text-green-400" /><span className="text-green-300">Both models agree: normal account</span></>}
+              <>
+                <div className="text-slate-600 text-xl">·</div>
+                <div className="text-center">
+                  <p className={`text-3xl font-bold ${scoreColor(knn)}`}>{knn.toFixed(0)}</p>
+                  <p className="text-xs text-slate-400">KNN score</p>
                 </div>
-              </div>
+              </>
             )}
-          </div>
-
-          {/* Account info */}
-          <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 space-y-2">
-            <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">Account Info</p>
-            {[
-              ['Type',     account.account_type   ?? '—'],
-              ['Bank',     account.bank_name       ?? '—'],
-              ['Number',   account.account_number  ?? '—'],
-              ['Scored',   account.scored_at       ?? 'Not scored yet'],
-            ].map(([k, v]) => (
-              <div key={k} className="flex justify-between text-sm">
-                <span className="text-slate-500">{k}</span>
-                <span className="text-slate-200">{v}</span>
+            <div className="ml-auto text-right space-y-1">
+              {detail?.mule_label_reason && (
+                <p className="text-xs text-red-300">
+                  <AlertTriangle className="w-3 h-3 inline mr-1" />
+                  {detail.mule_label_reason}
+                </p>
+              )}
+              {detail?.triggered_count != null && (
+                <p className="text-xs text-slate-400">
+                  {detail.triggered_count} of {detail.features?.length ?? 0} indicators triggered
+                </p>
+              )}
+              <div className="flex items-center gap-2 text-xs justify-end">
+                {sage >= 50 && knn >= 50
+                  ? <span className="text-red-300">Flagged by BOTH models</span>
+                  : sage >= 50
+                  ? <span className="text-orange-300">GraphSAGE flagged</span>
+                  : <span className="text-yellow-300">KNN flagged</span>}
               </div>
-            ))}
+            </div>
           </div>
+        </div>
 
-          {/* Customer info */}
-          {account.customer_id && (
-            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 space-y-2">
-              <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-3">Customer</p>
-              {[
-                ['Name',    account.customer_name    ?? '—'],
-                ['Country', account.customer_country ?? '—'],
-                ['ID',      account.customer_id],
-              ].map(([k, v]) => (
-                <div key={k} className="flex justify-between text-sm">
-                  <span className="text-slate-500">{k}</span>
-                  <span className="text-slate-200">{v}</span>
+        {/* Customer + account meta */}
+        <div className="px-5 py-3 border-b border-slate-700/30 grid grid-cols-2 gap-x-6 gap-y-1 text-xs shrink-0">
+          {[
+            ['Customer',   detail?.customer_name   ?? account.customer_name   ?? '—'],
+            ['Country',    detail?.customer_country ?? account.customer_country ?? '—'],
+            ['Account',    detail?.account_type    ?? account.account_type    ?? '—'],
+            ['Risk tier',  detail?.risk_tier       ?? '—'],
+            ['KYC',        detail?.kyc_level       ?? '—'],
+            ['PEP',        detail?.pep_flag ? '🔴 YES' : '✅ No'],
+          ].map(([k, v]) => (
+            <div key={k} className="flex justify-between py-0.5">
+              <span className="text-slate-500">{k}</span>
+              <span className="text-slate-300 font-medium">{v}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Tab bar */}
+        <div className="flex border-b border-slate-700/50 shrink-0">
+          {[
+            { id: 'features',      label: `Features (${detail?.features?.length ?? '…'})`,       icon: Activity },
+            { id: 'transactions',  label: `Fraud Txns (${detail?.fraud_txn_count ?? '…'})`,      icon: ShieldAlert },
+          ].map(t => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id as 'features' | 'transactions')}
+              className={`flex items-center gap-1.5 px-4 py-3 text-sm border-b-2 transition-colors ${
+                activeTab === t.id
+                  ? 'border-purple-500 text-purple-300'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <t.icon className="w-3.5 h-3.5" />
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Tab content */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {isLoading ? (
+            <div className="flex items-center justify-center h-32 text-slate-400 text-sm">
+              <RefreshCw className="w-4 h-4 animate-spin mr-2" /> Loading account analysis…
+            </div>
+          ) : activeTab === 'features' ? (
+            <div className="space-y-3">
+              {/* Feature summary */}
+              {detail?.feature_summary && (
+                <div className="grid grid-cols-3 gap-2 mb-4">
+                  {[
+                    { label: 'Fraud ratio', value: `${detail.feature_summary.fraud_ratio_pct}%`,   alert: detail.feature_summary.fraud_ratio_pct >= 30 },
+                    { label: 'Fraud txns',  value: `${detail.feature_summary.fraud_count}`,        alert: detail.feature_summary.fraud_count > 0 },
+                    { label: 'Pass-thru',   value: `${detail.feature_summary.pass_through}×`,      alert: detail.feature_summary.pass_through >= 0.7 },
+                    { label: 'Senders',     value: `${detail.feature_summary.unique_senders}`,     alert: detail.feature_summary.unique_senders > 10 },
+                    { label: 'Outbound',    value: `$${Number(detail.feature_summary.out_volume_usd).toLocaleString(undefined, {maximumFractionDigits: 0})}`, alert: false },
+                    { label: 'Patterns',    value: `${detail.feature_summary.pattern_count}`,      alert: detail.feature_summary.pattern_count >= 2 },
+                  ].map(item => (
+                    <div key={item.label} className={`rounded-lg p-2 text-center border ${item.alert ? 'bg-red-900/20 border-red-700/30' : 'bg-slate-800/40 border-slate-700/30'}`}>
+                      <p className="text-[10px] text-slate-500">{item.label}</p>
+                      <p className={`text-sm font-bold mt-0.5 ${item.alert ? 'text-red-300' : 'text-slate-300'}`}>{item.value}</p>
+                    </div>
+                  ))}
                 </div>
+              )}
+
+              {/* Per-feature rows */}
+              {detail?.features?.map(f => (
+                <FeatureRow key={f.name} feat={f} />
               ))}
+            </div>
+          ) : (
+            /* Transaction list */
+            <div className="space-y-2">
+              {!detail?.fraud_transactions?.length ? (
+                <div className="text-center text-slate-500 py-10">
+                  <CheckCircle2 className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                  No fraud transactions found for this account.
+                </div>
+              ) : (
+                detail.fraud_transactions.map((t, i) => (
+                  <div key={t.txn_id ?? i} className="bg-slate-800/50 border border-slate-700/40 rounded-xl p-3 space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        {t.direction === 'OUTBOUND'
+                          ? <ArrowUpRight   className="w-4 h-4 text-red-400   shrink-0" />
+                          : <ArrowDownLeft  className="w-4 h-4 text-blue-400  shrink-0" />}
+                        <div>
+                          <p className="text-xs text-slate-300 font-medium">{t.counterparty ?? 'Unknown'}</p>
+                          <p className="text-[10px] text-slate-500">
+                            {t.country ?? '—'}
+                            {t.timestamp && ` · ${String(t.timestamp).slice(0, 10)}`}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-sm font-semibold text-white">
+                          ${Number(t.amount).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                        </p>
+                        <p className="text-[10px] text-slate-500">{t.currency}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {t.fraud_type && (
+                        <span className="text-[10px] px-2 py-0.5 rounded border bg-red-900/30 border-red-700/40 text-red-300 font-medium">
+                          {t.fraud_type}
+                        </span>
+                      )}
+                      {t.is_fraud && (
+                        <span className="text-[10px] px-2 py-0.5 rounded border bg-orange-900/30 border-orange-700/40 text-orange-300">
+                          FRAUD
+                        </span>
+                      )}
+                      {t.outcome && (
+                        <span className={`text-[10px] px-2 py-0.5 rounded border font-medium ${
+                          t.outcome === 'DECLINE' ? 'bg-red-900/30 border-red-700/40 text-red-300'
+                          : t.outcome === 'CHALLENGE' ? 'bg-yellow-900/30 border-yellow-700/40 text-yellow-300'
+                          : 'bg-green-900/30 border-green-700/40 text-green-300'
+                        }`}>{t.outcome}</span>
+                      )}
+                      <span className={`text-[10px] px-2 py-0.5 rounded border ${
+                        t.direction === 'OUTBOUND'
+                          ? 'bg-red-900/20 border-red-700/30 text-red-400'
+                          : 'bg-blue-900/20 border-blue-700/30 text-blue-400'
+                      }`}>
+                        {t.direction}
+                      </span>
+                    </div>
+                    <p className="text-[10px] font-mono text-slate-600">
+                      {t.txn_id?.slice(0, 20)}…
+                    </p>
+                  </div>
+                ))
+              )}
             </div>
           )}
         </div>

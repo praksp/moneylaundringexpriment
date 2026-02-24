@@ -259,25 +259,148 @@ def get_snapshots_over_time(account_id: str, days: int = 30) -> list[dict]:
 
 
 def list_high_risk_accounts(limit: int = 50) -> list[dict]:
-    """Return accounts flagged as likely mules or high-risk."""
+    """
+    Return accounts flagged as high-risk.
+
+    Priority order:
+    1. Accounts WITH a FeatureSnapshot (manually computed)
+    2. Accounts flagged by GraphSAGE or KNN anomaly detector
+    3. Accounts with a high fraud-transaction ratio (computed on the fly)
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+
     with neo4j_session() as session:
+        # ── Tier 1: FeatureSnapshot nodes ──────────────────────────────────────
         records = list(session.run("""
             MATCH (fs:FeatureSnapshot)-[:FEATURE_SNAPSHOT_FOR]->(a:Account)
             MATCH (fs)-[:BELONGS_TO]->(c:Customer)
             WHERE fs.is_likely_mule = true OR fs.mule_score >= 40
-              OR fs.has_tor_activity = true
+               OR fs.has_tor_activity = true
             RETURN a.id AS account_id, a.account_number AS account_number,
                    c.id AS customer_id, c.name AS customer_name,
-                   fs.mule_score AS mule_score,
-                   fs.is_likely_mule AS is_likely_mule,
-                   fs.avg_risk_score_30d AS avg_risk_score,
-                   fs.turnover_ratio_30d AS turnover_ratio,
-                   fs.has_tor_activity AS tor_activity,
-                   fs.computed_at AS computed_at
+                   fs.mule_score             AS mule_score,
+                   fs.is_likely_mule         AS is_likely_mule,
+                   fs.avg_risk_score_30d     AS avg_risk_score,
+                   fs.turnover_ratio_30d     AS turnover_ratio,
+                   fs.has_tor_activity       AS tor_activity,
+                   fs.unique_senders_30d     AS unique_senders,
+                   fs.structuring_count_30d  AS structuring_count,
+                   fs.outbound_volume_30d    AS out_volume,
+                   fs.inbound_volume_30d     AS in_volume,
+                   fs.evaluation_count_30d   AS eval_count,
+                   fs.decline_count_30d      AS decline_count,
+                   fs.pep_flag               AS pep_flag,
+                   fs.risk_tier              AS risk_tier,
+                   fs.computed_at            AS computed_at,
+                   'feature_snapshot'        AS source
             ORDER BY fs.mule_score DESC
             LIMIT $limit
         """, limit=limit))
-    return [dict(r) for r in records]
+        for r in records:
+            d = dict(r)
+            seen.add(d["account_id"])
+            results.append(d)
+
+        still_need = limit - len(results)
+        if still_need <= 0:
+            return results
+
+        # ── Tier 2: GraphSAGE / KNN flagged accounts ─────────────────────────
+        records2 = list(session.run("""
+            MATCH (a:Account)
+            WHERE (a.graphsage_suspect = true OR a.mule_suspect = true)
+              AND NOT a.id IN $seen
+            OPTIONAL MATCH (c:Customer)-[:OWNS]->(a)
+            OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
+            OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+            WITH a, c,
+              coalesce(a.graphsage_score, 0)  AS sage_score,
+              coalesce(a.anomaly_score, 0)    AS knn_score,
+              count(DISTINCT t_out)           AS out_count,
+              coalesce(sum(t_out.amount_usd), 0) AS out_vol,
+              coalesce(sum(t_in.amount_usd), 0)  AS in_vol,
+              coalesce(sum(CASE WHEN t_out.is_fraud THEN 1.0 ELSE 0.0 END), 0) AS fraud_count
+            RETURN
+              a.id             AS account_id,
+              a.account_number AS account_number,
+              c.id             AS customer_id,
+              c.name           AS customer_name,
+              // Synthesise a mule_score from GraphSAGE + KNN
+              toInteger((sage_score * 0.6 + knn_score * 0.4))
+                               AS mule_score,
+              a.graphsage_suspect AS is_likely_mule,
+              0                AS avg_risk_score,
+              CASE WHEN in_vol > 0 THEN out_vol / in_vol ELSE 0 END
+                               AS turnover_ratio,
+              false            AS tor_activity,
+              null             AS unique_senders,
+              null             AS structuring_count,
+              out_vol          AS out_volume,
+              in_vol           AS in_volume,
+              out_count        AS eval_count,
+              fraud_count      AS decline_count,
+              false            AS pep_flag,
+              'UNKNOWN'        AS risk_tier,
+              a.graphsage_scored_at AS computed_at,
+              'graphsage_knn'  AS source
+            ORDER BY sage_score DESC
+            LIMIT $n
+        """, seen=list(seen), n=still_need))
+
+        for r in records2:
+            d = dict(r)
+            seen.add(d["account_id"])
+            results.append(d)
+
+        still_need2 = limit - len(results)
+        if still_need2 <= 0:
+            return results
+
+        # ── Tier 3: Accounts with ≥30% fraud txns (computed on the fly) ──────
+        records3 = list(session.run("""
+            MATCH (a:Account)-[:INITIATED]->(t:Transaction)
+            WHERE NOT a.id IN $seen
+            WITH a,
+              count(t) AS total,
+              sum(CASE WHEN t.is_fraud THEN 1 ELSE 0 END) AS fraud_c
+            WHERE total > 0 AND toFloat(fraud_c) / total >= 0.30
+            OPTIONAL MATCH (c:Customer)-[:OWNS]->(a)
+            OPTIONAL MATCH (a)-[:INITIATED]->(t2:Transaction)
+            OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+            WITH a, c, total, fraud_c,
+              coalesce(sum(t2.amount_usd), 0) AS out_vol,
+              coalesce(sum(t_in.amount_usd), 0) AS in_vol
+            RETURN
+              a.id             AS account_id,
+              a.account_number AS account_number,
+              c.id             AS customer_id,
+              c.name           AS customer_name,
+              toInteger(toFloat(fraud_c) / total * 100)
+                               AS mule_score,
+              true             AS is_likely_mule,
+              0                AS avg_risk_score,
+              CASE WHEN in_vol > 0 THEN out_vol / in_vol ELSE 0 END
+                               AS turnover_ratio,
+              false            AS tor_activity,
+              null             AS unique_senders,
+              null             AS structuring_count,
+              out_vol          AS out_volume,
+              in_vol           AS in_volume,
+              total            AS eval_count,
+              fraud_c          AS decline_count,
+              false            AS pep_flag,
+              'HIGH'           AS risk_tier,
+              null             AS computed_at,
+              'fraud_ratio'    AS source
+            ORDER BY mule_score DESC
+            LIMIT $n
+        """, seen=list(seen), n=still_need2))
+        for r in records3:
+            results.append(dict(r))
+
+    results.sort(key=lambda x: float(x.get("mule_score") or 0), reverse=True)
+    return results[:limit]
 
 
 def _compute_mule_score(is_pass_through: bool, high_sender_count: bool,

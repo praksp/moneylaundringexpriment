@@ -465,6 +465,29 @@ export interface GraphSAGESummary {
   feature_flag_on: boolean
 }
 
+export interface GraphSAGEFeature {
+  name: string
+  value: number | string
+  unit: string
+  threshold: number | string
+  triggered: boolean
+  weight_pct: number
+  description: string
+}
+
+export interface GraphSAGEFraudTxn {
+  txn_id: string
+  direction: 'OUTBOUND' | 'INBOUND'
+  amount: number
+  currency: string
+  timestamp: string | null
+  is_fraud: boolean
+  fraud_type: string | null
+  outcome: string | null
+  counterparty: string | null
+  country: string | null
+}
+
 export interface GraphSAGEAccountDetail {
   account_id: string
   graphsage_score: number
@@ -473,12 +496,33 @@ export interface GraphSAGEAccountDetail {
   knn_anomaly_score: number | null
   knn_suspect: boolean
   flagged_by_both: boolean
+  mule_label_reason: string | null
   account_number: string | null
   bank_name: string | null
   account_type: string | null
+  account_country: string | null
   customer_id: string | null
   customer_name: string | null
   customer_country: string | null
+  pep_flag: boolean
+  sanctions_flag: boolean
+  kyc_level: string | null
+  risk_tier: string | null
+  features: GraphSAGEFeature[]
+  triggered_count: number
+  feature_summary: {
+    fraud_ratio_pct: number
+    fraud_count: number
+    pattern_count: number
+    pass_through: number
+    unique_senders: number
+    out_volume_usd: number
+    in_volume_usd: number
+    out_txn_count: number
+    in_txn_count: number
+  }
+  fraud_transactions: GraphSAGEFraudTxn[]
+  fraud_txn_count: number
 }
 
 export interface GraphSAGEComparison {

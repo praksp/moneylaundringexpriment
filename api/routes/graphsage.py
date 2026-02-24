@@ -157,48 +157,279 @@ async def graphsage_summary():
 
 @router.get("/accounts/{account_id}", dependencies=[Depends(require_admin)])
 async def get_account_graphsage(account_id: str):
-    """GraphSAGE score for a single account."""
-    from ml.graphsage import get_sage, get_graph_cache, build_account_graph, set_graph_cache
+    """
+    GraphSAGE score for a single account with full feature explanation
+    and list of fraud / high-risk transactions that triggered the flag.
+    """
+    from ml.graphsage import get_sage
     model = get_sage()
     if not model.is_trained:
         raise HTTPException(503, "GraphSAGE model not trained. POST /graphsage/train first.")
 
-    # Use cached graph if available, otherwise score from Neo4j properties
     with neo4j_session() as s:
+        # ── Core account + score row ──────────────────────────────────────────
         row = s.run("""
             MATCH (a:Account {id: $id})
             OPTIONAL MATCH (c:Customer)-[:OWNS]->(a)
             RETURN
-              a.graphsage_score     AS score,
-              a.graphsage_suspect   AS suspect,
-              a.graphsage_scored_at AS scored_at,
-              a.anomaly_score       AS knn_score,
-              a.mule_suspect        AS knn_suspect,
-              a.account_number      AS account_number,
-              a.bank_name           AS bank_name,
-              a.account_type        AS account_type,
-              c.id   AS customer_id,
-              c.name AS customer_name,
-              c.country_of_residence AS country
+              a.graphsage_score        AS score,
+              a.graphsage_suspect      AS suspect,
+              a.graphsage_scored_at    AS scored_at,
+              a.anomaly_score          AS knn_score,
+              a.mule_suspect           AS knn_suspect,
+              a.account_number         AS account_number,
+              a.bank_name              AS bank_name,
+              a.account_type           AS account_type,
+              a.country                AS account_country,
+              c.id                     AS customer_id,
+              c.name                   AS customer_name,
+              c.country_of_residence   AS country,
+              c.pep_flag               AS pep_flag,
+              c.sanctions_flag         AS sanctions_flag,
+              c.kyc_level              AS kyc_level,
+              c.risk_tier              AS risk_tier
         """, id=account_id).single()
 
-    if row is None:
-        raise HTTPException(404, "Account not found")
+        if row is None:
+            raise HTTPException(404, "Account not found")
 
+        # ── Feature vector used by GraphSAGE ─────────────────────────────────
+        feat_row = s.run("""
+            MATCH (a:Account {id: $id})
+            OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
+            OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+            WITH a,
+              count(DISTINCT t_out)                                          AS out_count,
+              coalesce(sum(t_out.amount_usd), 0)                             AS out_vol,
+              count(DISTINCT t_in)                                           AS in_count,
+              coalesce(sum(t_in.amount_usd), 0)                              AS in_vol,
+              coalesce(avg(t_out.amount_usd), 0)                             AS avg_out,
+              coalesce(sum(CASE WHEN t_out.is_fraud THEN 1 ELSE 0 END), 0)  AS fraud_count,
+              coalesce(sum(CASE WHEN t_out.fraud_type IN
+                ['SMURFING','LAYERING','STRUCTURING','ROUND_TRIP',
+                 'DORMANT_BURST','HIGH_RISK_CORRIDOR','RAPID_VELOCITY']
+                THEN 1 ELSE 0 END), 0)                                       AS pattern_count
+            RETURN out_count, out_vol, in_count, in_vol, avg_out,
+                   fraud_count, pattern_count,
+                   CASE WHEN out_count > 0 THEN toFloat(fraud_count) / out_count ELSE 0 END
+                       AS fraud_ratio,
+                   CASE WHEN in_vol > 100 THEN out_vol / in_vol ELSE 0 END
+                       AS pass_through_ratio
+        """, id=account_id).single()
+
+        # ── Fraud & high-risk transactions ────────────────────────────────────
+        txn_rows = s.run("""
+            MATCH (a:Account {id: $id})-[:INITIATED]->(t:Transaction)-[:CREDITED_TO]->(recv:Account)
+            OPTIONAL MATCH (recv_c:Customer)-[:OWNS]->(recv)
+            WHERE t.is_fraud = true
+               OR t.fraud_type IS NOT NULL
+            RETURN
+              t.id          AS txn_id,
+              t.amount_usd  AS amount,
+              t.currency    AS currency,
+              t.timestamp   AS ts,
+              t.is_fraud    AS is_fraud,
+              t.fraud_type  AS fraud_type,
+              t.outcome     AS outcome,
+              recv.account_number AS recv_account,
+              recv.country        AS recv_country,
+              recv_c.name         AS recv_name
+            ORDER BY t.timestamp DESC
+            LIMIT 50
+        """, id=account_id).data()
+
+        # ── Incoming (received) suspicious transactions ────────────────────────
+        in_txn_rows = s.run("""
+            MATCH (sender:Account)-[:INITIATED]->(t:Transaction)-[:CREDITED_TO]->(a:Account {id: $id})
+            OPTIONAL MATCH (sender_c:Customer)-[:OWNS]->(sender)
+            WHERE t.is_fraud = true OR t.fraud_type IS NOT NULL
+            RETURN
+              t.id          AS txn_id,
+              t.amount_usd  AS amount,
+              t.currency    AS currency,
+              t.timestamp   AS ts,
+              t.is_fraud    AS is_fraud,
+              t.fraud_type  AS fraud_type,
+              sender.account_number AS sender_account,
+              sender.country        AS sender_country,
+              sender_c.name         AS sender_name,
+              'INBOUND'             AS direction
+            ORDER BY t.timestamp DESC
+            LIMIT 20
+        """, id=account_id).data()
+
+        # ── Unique senders (30d context) ──────────────────────────────────────
+        network_row = s.run("""
+            MATCH (sender:Account)-[:INITIATED]->(t:Transaction)-[:CREDITED_TO]->(a:Account {id: $id})
+            RETURN count(DISTINCT sender) AS unique_senders
+        """, id=account_id).single()
+
+    # ── Build feature explanation ──────────────────────────────────────────────
+    fv = feat_row or {}
+    out_count      = int(fv.get("out_count") or 0)
+    in_count       = int(fv.get("in_count") or 0)
+    out_vol        = float(fv.get("out_vol") or 0)
+    in_vol         = float(fv.get("in_vol") or 0)
+    fraud_count    = int(fv.get("fraud_count") or 0)
+    pattern_count  = int(fv.get("pattern_count") or 0)
+    fraud_ratio    = float(fv.get("fraud_ratio") or 0)
+    pass_thru      = float(fv.get("pass_through_ratio") or 0)
+    avg_out        = float(fv.get("avg_out") or 0)
+    unique_senders = int((network_row or {}).get("unique_senders") or 0)
+
+    _COUNTRY_RISK = {
+        "IR": 1.0, "KP": 1.0, "SY": 1.0, "RU": 0.8, "MM": 0.8, "VE": 0.8,
+        "NG": 0.7, "PK": 0.7, "CN": 0.3, "IN": 0.3, "AE": 0.4, "SA": 0.4,
+        "TR": 0.4, "ZA": 0.4, "BR": 0.4, "MX": 0.4, "KY": 0.6, "PA": 0.5,
+    }
+    country_risk = _COUNTRY_RISK.get(str(row.get("account_country") or ""), 0.0)
+
+    # Each feature: name, value, threshold, triggered (bool), weight %, description
+    features = [
+        {
+            "name": "Fraud Transaction Ratio",
+            "value": round(fraud_ratio * 100, 1),
+            "unit": "%",
+            "threshold": 30.0,
+            "triggered": fraud_ratio >= 0.30,
+            "weight_pct": 25,
+            "description": f"{fraud_count} of {out_count} outbound transactions are fraud",
+        },
+        {
+            "name": "Fraud Pattern Count",
+            "value": pattern_count,
+            "unit": "txns",
+            "threshold": 2,
+            "triggered": pattern_count >= 2,
+            "weight_pct": 20,
+            "description": "SMURFING / LAYERING / STRUCTURING / ROUND_TRIP patterns detected",
+        },
+        {
+            "name": "Pass-Through Ratio",
+            "value": round(pass_thru, 2),
+            "unit": "×",
+            "threshold": 0.7,
+            "triggered": 0.7 <= pass_thru <= 5.0 and in_vol > 1000,
+            "weight_pct": 16,
+            "description": f"Outflow ÷ Inflow = {pass_thru:.2f}×  (mule accounts relay funds)",
+        },
+        {
+            "name": "Unique Senders (all-time)",
+            "value": unique_senders,
+            "unit": "accounts",
+            "threshold": 10,
+            "triggered": unique_senders > 10,
+            "weight_pct": 15,
+            "description": "High sender diversity indicates smurfing / layering from many sources",
+        },
+        {
+            "name": "Outbound Volume",
+            "value": round(out_vol, 0),
+            "unit": "USD",
+            "threshold": 100_000,
+            "triggered": out_vol > 100_000,
+            "weight_pct": 12,
+            "description": f"${out_vol:,.0f} total outbound  |  ${avg_out:,.0f} avg per txn",
+        },
+        {
+            "name": "Country Risk",
+            "value": round(country_risk * 100, 0),
+            "unit": "/100",
+            "threshold": 30.0,
+            "triggered": country_risk >= 0.3,
+            "weight_pct": 7,
+            "description": f"Account registered in high-risk jurisdiction ({row.get('account_country') or 'unknown'})",
+        },
+        {
+            "name": "PEP / Sanctions Flag",
+            "value": "YES" if (row.get("pep_flag") or row.get("sanctions_flag")) else "NO",
+            "unit": "",
+            "threshold": "YES",
+            "triggered": bool(row.get("pep_flag") or row.get("sanctions_flag")),
+            "weight_pct": 5,
+            "description": "Politically Exposed Person or sanctions watchlist match",
+        },
+    ]
+
+    # Combine outbound + inbound fraud txns
+    all_txns = [
+        {
+            "txn_id":       t["txn_id"],
+            "direction":    "OUTBOUND",
+            "amount":       float(t.get("amount") or 0),
+            "currency":     t.get("currency") or "USD",
+            "timestamp":    t.get("ts"),
+            "is_fraud":     bool(t.get("is_fraud")),
+            "fraud_type":   t.get("fraud_type"),
+            "outcome":      t.get("outcome"),
+            "counterparty": t.get("recv_name") or t.get("recv_account") or "Unknown",
+            "country":      t.get("recv_country"),
+        }
+        for t in txn_rows
+    ] + [
+        {
+            "txn_id":       t["txn_id"],
+            "direction":    "INBOUND",
+            "amount":       float(t.get("amount") or 0),
+            "currency":     t.get("currency") or "USD",
+            "timestamp":    t.get("ts"),
+            "is_fraud":     bool(t.get("is_fraud")),
+            "fraud_type":   t.get("fraud_type"),
+            "outcome":      None,
+            "counterparty": t.get("sender_name") or t.get("sender_account") or "Unknown",
+            "country":      t.get("sender_country"),
+        }
+        for t in in_txn_rows
+    ]
+    all_txns.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
+
+    triggered_features = [f for f in features if f["triggered"]]
+    mule_label_reason = (
+        "≥30% fraud transaction ratio" if fraud_ratio >= 0.30
+        else "≥2 fraud pattern transactions"
+        if pattern_count >= 2
+        else "network graph structural pattern"
+    )
+
+    sage_score = float(row.get("score") or 0)
     return {
         "account_id":         account_id,
-        "graphsage_score":    float(row.get("score") or 0),
+        "graphsage_score":    sage_score,
         "is_suspect":         bool(row.get("suspect") or False),
         "scored_at":          row.get("scored_at"),
         "knn_anomaly_score":  float(row["knn_score"]) if row.get("knn_score") is not None else None,
         "knn_suspect":        bool(row.get("knn_suspect") or False),
         "flagged_by_both":    bool(row.get("suspect") and row.get("knn_suspect")),
+        "mule_label_reason":  mule_label_reason,
+        # Account info
         "account_number":     row.get("account_number"),
         "bank_name":          row.get("bank_name"),
         "account_type":       row.get("account_type"),
+        "account_country":    row.get("account_country"),
         "customer_id":        row.get("customer_id"),
         "customer_name":      row.get("customer_name"),
         "customer_country":   row.get("country"),
+        "pep_flag":           bool(row.get("pep_flag") or False),
+        "sanctions_flag":     bool(row.get("sanctions_flag") or False),
+        "kyc_level":          row.get("kyc_level"),
+        "risk_tier":          row.get("risk_tier"),
+        # Feature explanation
+        "features":           features,
+        "triggered_count":    len(triggered_features),
+        "feature_summary": {
+            "fraud_ratio_pct":   round(fraud_ratio * 100, 1),
+            "fraud_count":       fraud_count,
+            "pattern_count":     pattern_count,
+            "pass_through":      round(pass_thru, 2),
+            "unique_senders":    unique_senders,
+            "out_volume_usd":    round(out_vol, 0),
+            "in_volume_usd":     round(in_vol, 0),
+            "out_txn_count":     out_count,
+            "in_txn_count":      in_count,
+        },
+        # Suspicious transactions
+        "fraud_transactions":      all_txns,
+        "fraud_txn_count":         len(all_txns),
     }
 
 
