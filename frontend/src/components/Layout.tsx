@@ -2,7 +2,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import {
   ShieldAlert, Send, Users, Activity,
   Database, BarChart3, Globe, LogOut, ChevronDown,
-  Shield, Eye,
+  Shield, Eye, ScanSearch,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useState } from 'react'
@@ -21,8 +21,9 @@ export default function Layout() {
     { to: '/overview', label: 'Global Overview', icon: Globe, roles: ['admin', 'viewer'] },
     // Admin-only
     { to: '/customers', label: 'Customer Profiles', icon: Users, roles: ['admin'] },
-    { to: '/features', label: 'Feature Store', icon: Database, roles: ['admin'] },
-    { to: '/monitor', label: 'Model Monitor', icon: Activity, roles: ['admin', 'viewer'] },
+    { to: '/anomaly',   label: 'Anomaly Detection', icon: ScanSearch, roles: ['admin'] },
+    { to: '/features',  label: 'Feature Store', icon: Database, roles: ['admin'] },
+    { to: '/monitor',   label: 'Model Monitor', icon: Activity, roles: ['admin', 'viewer'] },
   ]
 
   const visibleNav = navItems.filter(item => item.roles.includes(user?.role ?? ''))

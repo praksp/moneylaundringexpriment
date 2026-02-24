@@ -28,7 +28,8 @@ from rich.table import Table
 
 from db.client import neo4j_session
 from risk.features import extract_features, FeatureVector
-from ml.model import AMLModel, SVMModel, KNNModel, reset_registry
+from ml.model import AMLModel, SVMModel, reset_registry
+from ml.anomaly import MuleAccountDetector, reset_detector
 
 console = Console()
 
@@ -199,7 +200,8 @@ def train_and_save() -> AMLModel:
 
 def train_and_save_all() -> dict:
     """
-    Train XGBoost (hist), SGD/SVM, and FAISS-KNN on the same streamed dataset.
+    Train XGBoost (hist) + SGD/SVM on the shared dataset, then train the
+    KNN anomaly detector on normal transactions.
     Returns a dict of per-model metrics.
     """
     X, y, _ = build_training_data()
@@ -225,18 +227,18 @@ def train_and_save_all() -> dict:
     all_metrics["svm"] = {k: v for k, v in m.items() if k != "classification_report"}
     console.print("[bold green]✓ SGD/SVM saved[/]")
 
-    # ── FAISS IVF-PQ KNN ──────────────────────────────────────────────────────
-    try:
-        import faiss
-        console.print("\n[bold cyan]━━━ Training KNN (FAISS IVF-PQ) ━━━[/]")
-    except ImportError:
-        console.print("\n[bold cyan]━━━ Training KNN (sklearn ball_tree fallback) ━━━[/]")
-    knn = KNNModel()
-    m = knn.fit(X, y)
-    _print_metrics("KNN", m)
-    knn.save()
-    all_metrics["knn"] = {k: v for k, v in m.items() if k != "classification_report"}
-    console.print("[bold green]✓ KNN saved[/]")
+    # ── KNN Anomaly Detector (self-loads a sample of normal txns) ────────────
+    console.print("\n[bold cyan]━━━ Training KNN Mule-Account Anomaly Detector ━━━[/]")
+    detector = MuleAccountDetector()
+    m_anom = detector.fit()   # loads its own data — avoids duplicating the 1GB X array
+    detector.save()
+    reset_detector()
+    all_metrics["anomaly"] = m_anom
+    console.print(
+        f"  Normal vectors indexed: {m_anom['n_normal_vectors']:,}  "
+        f"| p95 dist: {m_anom['p95_dist']}"
+    )
+    console.print("[bold green]✓ Anomaly detector saved[/]")
 
     # ── Metadata for drift detection ──────────────────────────────────────────
     _save_training_metadata(X, y, xgb, all_metrics)

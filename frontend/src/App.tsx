@@ -9,6 +9,7 @@ import CustomerProfiles from './pages/CustomerProfiles'
 import FeatureStore from './pages/FeatureStore'
 import ModelMonitor from './pages/ModelMonitor'
 import Overview from './pages/Overview'
+import AnomalyDetection from './pages/AnomalyDetection'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -69,6 +70,10 @@ function AppRoutes() {
         <Route
           path="features"
           element={<RequireAdmin><FeatureStore /></RequireAdmin>}
+        />
+        <Route
+          path="anomaly"
+          element={<RequireAdmin><AnomalyDetection /></RequireAdmin>}
         />
       </Route>
 

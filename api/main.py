@@ -25,8 +25,10 @@ from api.routes.profiles import router as profiles_router
 from api.routes.monitoring import router as monitoring_router
 from api.routes.submit import router as submit_router
 from api.routes.auth import router as auth_router
+from api.routes.anomaly import router as anomaly_router
 from db.client import get_driver, close_driver
 from ml.model import get_model, get_registry
+from ml.anomaly import get_detector
 from monitoring.logger import ensure_schema
 from auth.security import seed_default_users
 from config.settings import settings
@@ -37,7 +39,8 @@ async def lifespan(app: FastAPI):
     # Startup
     get_driver()            # Verify Neo4j connectivity
     get_model()             # Pre-load XGBoost (legacy)
-    get_registry()          # Pre-load all models (XGBoost + SVM + KNN)
+    get_registry()          # Pre-load risk models (XGBoost + SVM)
+    get_detector()          # Pre-load KNN anomaly detector
     ensure_schema()         # Prediction log constraints
     seed_default_users()    # Create admin/viewer users if not present
     yield
@@ -69,6 +72,7 @@ app.include_router(txn_router)
 app.include_router(eval_router)
 app.include_router(profiles_router)
 app.include_router(monitoring_router)
+app.include_router(anomaly_router)
 
 
 @app.get("/health", tags=["System"])
@@ -84,12 +88,13 @@ async def health_check():
         neo4j_error = str(e)
 
     registry = get_registry()
+    detector = get_detector()
     models_status = {
         "xgboost": registry.xgb.is_trained,
-        "svm": registry.svm.is_trained,
-        "knn": registry.knn.is_trained,
+        "svm":     registry.svm.is_trained,
+        "anomaly_detector": detector.is_trained,
     }
-    all_models_ok = any(models_status.values())
+    all_models_ok = any([registry.xgb.is_trained, registry.svm.is_trained])
 
     return {
         "status": "healthy" if (neo4j_ok and all_models_ok) else "degraded",

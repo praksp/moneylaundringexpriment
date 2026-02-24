@@ -402,7 +402,7 @@ class KNNModel:
 
     # Use FAISS only when the dataset is large enough for it to pay off.
     # Below this threshold sklearn ball-tree is faster (no thread-init overhead).
-    _FAISS_THRESHOLD = 500_000
+    _FAISS_THRESHOLD = 50_000
 
     # ── Training ───────────────────────────────────────────────────────────────
 
@@ -425,7 +425,7 @@ class KNNModel:
     # • _FLAT_PQ_MIN – _IVF_MIN → FAISS IndexFlatL2 (exact L2, no quantization)
     # • >= _IVF_MIN    → FAISS IndexIVFPQ (partitioned PQ, sub-linear queries)
     _FLAT_PQ_MIN = 50_000
-    _IVF_MIN     = 500_000
+    _IVF_MIN     = 5_000_000   # Only use IVF-PQ at 5M+ samples; FlatL2 is fast enough below that
 
     def _fit_faiss(self, X_tr, y_tr, X_v, y_v) -> dict:
         """
@@ -470,10 +470,21 @@ class KNNModel:
         self._faiss_index  = index
         self._train_labels = y_tr.astype(np.int32)
 
-        # Calibrate threshold using validation probabilities
-        probs_v = self._query_proba(X_v_s)
+        # Subsample validation set for evaluation — statistically sufficient and
+        # avoids O(n_val × n_train) brute-force search which is prohibitively slow
+        # for large datasets (e.g. 132k queries × 529k train = 18 trillion FLOPs).
+        _EVAL_CAP = 8_000
+        if len(X_v_s) > _EVAL_CAP:
+            rng  = np.random.default_rng(42)
+            idx  = rng.choice(len(X_v_s), _EVAL_CAP, replace=False)
+            X_ev = X_v_s[idx]
+            y_ev = y_v[idx]
+        else:
+            X_ev, y_ev = X_v_s, y_v
+
+        probs_v = self._query_proba(X_ev)
         from sklearn.metrics import precision_recall_curve
-        precision, recall, thresholds = precision_recall_curve(y_v, probs_v)
+        precision, recall, thresholds = precision_recall_curve(y_ev, probs_v)
         f1 = 2 * precision * recall / (precision + recall + 1e-9)
         best = int(np.argmax(f1[:-1]))
         self.threshold = float(thresholds[best]) if len(thresholds) > 0 else 0.3
@@ -481,11 +492,11 @@ class KNNModel:
         # Build metrics
         from sklearn.metrics import roc_auc_score, average_precision_score, classification_report
         return {
-            "roc_auc": round(roc_auc_score(y_v, probs_v), 4),
-            "avg_precision": round(average_precision_score(y_v, probs_v), 4),
+            "roc_auc": round(roc_auc_score(y_ev, probs_v), 4),
+            "avg_precision": round(average_precision_score(y_ev, probs_v), 4),
             "best_threshold": round(self.threshold, 4),
             "classification_report": classification_report(
-                y_v, (probs_v >= self.threshold).astype(int),
+                y_ev, (probs_v >= self.threshold).astype(int),
                 target_names=["legitimate", "fraud"],
             ),
             "index_type": index_type,
@@ -517,23 +528,26 @@ class KNNModel:
 
     def _query_proba(self, X_scaled: np.ndarray) -> np.ndarray:
         """
-        Distance-weighted fraud probability for each row in X_scaled using FAISS.
-        Inverse-distance weights (1/d) replicate sklearn's weights='distance'.
-        Works with both IndexPQ (flat) and IndexIVFPQ index types.
+        Vectorised distance-weighted fraud probability using FAISS.
+        All computation runs in NumPy (no Python row-by-row loop).
         """
-        X_scaled = np.ascontiguousarray(X_scaled, dtype=np.float32)
+        X_scaled  = np.ascontiguousarray(X_scaled, dtype=np.float32)
         distances, indices = self._faiss_index.search(X_scaled, self._K)
-        probs = np.zeros(len(X_scaled), dtype=np.float32)
-        for i, (dists, idxs) in enumerate(zip(distances, indices)):
-            valid = idxs >= 0
-            if not valid.any():
-                continue
-            d = dists[valid].astype(np.float64)
-            # Avoid division by zero for exact matches
-            weights = np.where(d == 0, 1e6, 1.0 / (d + 1e-9))
-            labels  = self._train_labels[idxs[valid]]
-            probs[i] = float(np.sum(weights * (labels == 1)) / np.sum(weights))
-        return probs
+
+        # distances / indices: (n_queries, K) — invalid neighbours have idx == -1
+        valid   = indices >= 0                                  # (n, K) bool
+        d       = np.where(valid, distances.astype(np.float64), np.inf)
+        weights = np.where(d == 0, 1e6, 1.0 / (d + 1e-9))     # inv-dist weights
+        weights = np.where(valid, weights, 0.0)                 # mask invalid
+
+        # Gather labels: replace -1 indices with 0 (label doesn't matter; weight=0)
+        safe_idx = np.where(valid, indices, 0)
+        labels   = self._train_labels[safe_idx]                 # (n, K) int32
+
+        fraud_w  = np.sum(weights * (labels == 1), axis=1)
+        total_w  = np.sum(weights, axis=1)
+        probs    = np.where(total_w > 0, fraud_w / total_w, 0.0)
+        return probs.astype(np.float32)
 
     def predict_proba_single(self, fv: FeatureVector) -> float:
         arr = np.array([fv.to_ml_array()], dtype=np.float32)
@@ -586,26 +600,25 @@ class KNNModel:
 
 class ModelRegistry:
     """
-    Holds all trained models and provides a unified scoring interface.
-    Ensemble weights: Bayesian 40% | XGBoost 30% | SVM 20% | KNN 10%
+    Holds risk-scoring models: Bayesian 40% | XGBoost 40% | SVM 20%.
+    KNN is no longer in the real-time scoring pipeline — it is used exclusively
+    for mule-account anomaly detection (see ml/anomaly.py).
     """
 
     ENSEMBLE_WEIGHTS = {
         "bayesian": 0.40,
-        "xgb":      0.30,
+        "xgb":      0.40,
         "svm":      0.20,
-        "knn":      0.10,
     }
 
     def __init__(self):
         self.xgb = AMLModel()
         self.svm = SVMModel()
-        self.knn = KNNModel()
 
     def load_all(self) -> dict[str, bool]:
-        """Load all models, return status dict."""
+        """Load scoring models, return status dict."""
         status: dict[str, bool] = {}
-        for name, model in [("xgb", self.xgb), ("svm", self.svm), ("knn", self.knn)]:
+        for name, model in [("xgb", self.xgb), ("svm", self.svm)]:
             try:
                 model.load()
                 status[name] = True
@@ -614,12 +627,9 @@ class ModelRegistry:
         return status
 
     def score_all(self, fv: FeatureVector) -> dict[str, int]:
-        """
-        Returns raw 0-999 score from each ML model.
-        Falls back to 0 if a model isn't trained.
-        """
+        """Returns raw 0-999 score from XGBoost and SVM."""
         scores: dict[str, int] = {}
-        for name, model in [("xgb", self.xgb), ("svm", self.svm), ("knn", self.knn)]:
+        for name, model in [("xgb", self.xgb), ("svm", self.svm)]:
             if model.is_trained:
                 prob = model.predict_proba_single(fv)
                 scores[name] = max(0, min(999, round(prob * 999)))
@@ -628,16 +638,16 @@ class ModelRegistry:
         return scores
 
     def fuse(self, bayesian_score: int, ml_scores: dict[str, int]) -> int:
-        """Weighted ensemble of Bayesian + all ML models."""
+        """Weighted ensemble of Bayesian + XGBoost + SVM."""
         w = self.ENSEMBLE_WEIGHTS
-        total_ml_weight = w["xgb"] + w["svm"] + w["knn"]
+        total_ml_weight = w["xgb"] + w["svm"]
         available = {k: v for k, v in ml_scores.items() if v > 0}
         if not available:
             return max(0, min(999, bayesian_score))
 
         ml_contrib = sum(
             ml_scores.get(k, 0) * w.get(k, 0)
-            for k in ("xgb", "svm", "knn")
+            for k in ("xgb", "svm")
         ) / total_ml_weight
 
         fused = (bayesian_score * w["bayesian"] +
@@ -646,7 +656,7 @@ class ModelRegistry:
 
     @property
     def any_ml_trained(self) -> bool:
-        return any([self.xgb.is_trained, self.svm.is_trained, self.knn.is_trained])
+        return any([self.xgb.is_trained, self.svm.is_trained])
 
 
 # ── Singletons ─────────────────────────────────────────────────────────────────

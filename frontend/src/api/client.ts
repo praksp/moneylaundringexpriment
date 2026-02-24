@@ -363,3 +363,66 @@ export const getDriftHistory = () =>
 
 export const labelPrediction = (transactionId: string, isFraud: boolean) =>
   api.post(`/monitoring/predictions/${transactionId}/label`, { is_fraud: isFraud }).then(r => r.data)
+
+// ── Anomaly Detection ─────────────────────────────────────────────────────────
+
+export interface AnomalyAccountResult {
+  account_id: string
+  anomaly_score: number
+  knn_distance_score: number
+  rule_score: number
+  is_mule_suspect: boolean
+  indicators: string[]
+  pass_through_ratio: number
+  unique_senders_30d: number
+  structuring_30d: number
+  in_volume: number
+  out_volume: number
+  customer_id: string | null
+  customer_name: string | null
+  customer_country: string | null
+  account_number: string | null
+  bank_name: string | null
+  account_type: string | null
+  scored_at: string | null
+}
+
+export interface SuspectListResponse {
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+  suspects: AnomalyAccountResult[]
+  detector_trained: boolean
+}
+
+export interface AnomalySummary {
+  total_accounts: number
+  scored_accounts: number
+  mule_suspects: number
+  high_risk_accounts: number
+  suspect_rate_pct: number
+  indicator_distribution: { indicator: string; freq: number }[]
+  detector_trained: boolean
+  coverage_pct: number
+}
+
+export const getAnomalySummary = () =>
+  api.get<AnomalySummary>('/anomaly/summary').then(r => r.data)
+
+export const listMuleSuspects = (page = 1, pageSize = 50) =>
+  api.get<SuspectListResponse>('/anomaly/suspects', {
+    params: { page, page_size: pageSize },
+  }).then(r => r.data)
+
+export const getAccountAnomaly = (accountId: string) =>
+  api.get<AnomalyAccountResult>(`/anomaly/accounts/${accountId}`).then(r => r.data)
+
+export const getCustomerAnomaly = (customerId: string) =>
+  api.get(`/anomaly/customers/${customerId}`).then(r => r.data)
+
+export const trainAnomalyDetector = () =>
+  api.post('/anomaly/train').then(r => r.data)
+
+export const scanAccounts = (force = false) =>
+  api.post('/anomaly/scan', null, { params: { force } }).then(r => r.data)

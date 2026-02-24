@@ -177,10 +177,12 @@ def _fetch_graph_context(txn_id: str) -> Optional[dict]:
 
 def _score_all_models(fv: FeatureVector, bayesian_score: int) -> tuple[int, dict, list]:
     """
-    Run all models and return (final_score, ml_scores_dict, model_score_objects).
+    Run Bayesian + XGBoost + SVM and return (final_score, ml_scores_dict, model_score_objects).
+    KNN is no longer part of real-time scoring — it is used exclusively for mule-account
+    anomaly detection via ml/anomaly.py.
     """
     registry = get_registry()
-    ml_scores = registry.score_all(fv)           # {"xgb": int, "svm": int, "knn": int}
+    ml_scores = registry.score_all(fv)           # {"xgb": int, "svm": int}
     final_score = registry.fuse(bayesian_score, ml_scores)
 
     weights = registry.ENSEMBLE_WEIGHTS
@@ -204,18 +206,10 @@ def _score_all_models(fv: FeatureVector, bayesian_score: int) -> tuple[int, dict
         ModelScore(
             score=ml_scores.get("svm", 0),
             probability=round(ml_scores.get("svm", 0) / 999, 4),
-            label="SVM (RBF)",
+            label="SVM (linear)",
             short="svm",
             is_trained=registry.svm.is_trained,
             weight_pct=round(weights["svm"] * 100),
-        ),
-        ModelScore(
-            score=ml_scores.get("knn", 0),
-            probability=round(ml_scores.get("knn", 0) / 999, 4),
-            label="KNN (k=7)",
-            short="knn",
-            is_trained=registry.knn.is_trained,
-            weight_pct=round(weights["knn"] * 100),
         ),
     ]
     return final_score, ml_scores, model_score_objs
@@ -284,7 +278,6 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
     final_score, ml_scores, model_score_objs = _score_all_models(fv, bayesian_score)
     xgb_score = ml_scores.get("xgb", 0)
     svm_score  = ml_scores.get("svm", 0)
-    knn_score  = ml_scores.get("knn", 0)
 
     # ── Outcome decision ─────────────────────────────────────────
     outcome = _determine_outcome(final_score)
@@ -296,7 +289,7 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
         bayesian_score=bayesian_score,
         ml_score=xgb_score,
         svm_score=svm_score,
-        knn_score=knn_score,
+        knn_score=0,   # KNN reserved for anomaly detection only
         model_scores=model_score_objs,
         outcome=outcome,
         risk_factors=bayes_result.triggered_factors,
@@ -324,7 +317,7 @@ def evaluate_transaction_by_id(txn_id: str) -> dict:
             confidence=round(confidence, 4),
             processing_time_ms=round(elapsed_ms, 2),
             svm_score=svm_score,
-            knn_score=knn_score,
+            knn_score=0,
         )
     except Exception:
         pass
@@ -353,7 +346,6 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
     final_score, ml_scores, model_score_objs = _score_all_models(fv, bayesian_score)
     xgb_score = ml_scores.get("xgb", 0)
     svm_score  = ml_scores.get("svm", 0)
-    knn_score  = ml_scores.get("knn", 0)
 
     outcome = _determine_outcome(final_score)
     explanation = _build_explanation(outcome, final_score, bayes_result.triggered_factors)
@@ -364,7 +356,7 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
         bayesian_score=bayesian_score,
         ml_score=xgb_score,
         svm_score=svm_score,
-        knn_score=knn_score,
+        knn_score=0,   # KNN reserved for anomaly detection only
         model_scores=model_score_objs,
         outcome=outcome,
         risk_factors=bayes_result.triggered_factors,
@@ -391,7 +383,7 @@ def evaluate_transaction_inline(txn_data: dict, graph_data: dict) -> dict:
             confidence=round(confidence, 4),
             processing_time_ms=round(elapsed_ms, 2),
             svm_score=svm_score,
-            knn_score=knn_score,
+            knn_score=0,
         )
     except Exception:
         pass
