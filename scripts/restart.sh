@@ -3,7 +3,7 @@
 # restart.sh — Clean restart for the AML detection application
 #
 # Stops:  uvicorn (FastAPI backend)  +  vite (React frontend)
-# Starts: uvicorn on :8000  +  vite dev server on :5173
+# Starts: uvicorn on :8001  +  vite dev server on :5174
 # Logs:   logs/backend.log  +  logs/frontend.log
 # =============================================================================
 
@@ -50,16 +50,16 @@ done
 pkill -f "uvicorn api.main:app" 2>/dev/null && info "Killed uvicorn" || true
 pkill -f "vite"                 2>/dev/null && info "Killed vite"    || true
 
-# Release port 8000 if still bound
-if lsof -ti:8000 &>/dev/null; then
-  warn "Port 8000 still in use — force-killing…"
-  lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+# Release port 8001 if still bound
+if lsof -ti:8001 &>/dev/null; then
+  warn "Port 8001 still in use — force-killing…"
+  lsof -ti:8001 | xargs kill -9 2>/dev/null || true
 fi
 
-# Release port 5173 if still bound
-if lsof -ti:5173 &>/dev/null; then
-  warn "Port 5173 still in use — force-killing…"
-  lsof -ti:5173 | xargs kill -9 2>/dev/null || true
+# Release port 5174 if still bound
+if lsof -ti:5174 &>/dev/null; then
+  warn "Port 5174 still in use — force-killing…"
+  lsof -ti:5174 | xargs kill -9 2>/dev/null || true
 fi
 
 sleep 1
@@ -77,14 +77,14 @@ else
 fi
 
 # ── Step 3: Start FastAPI backend ─────────────────────────────────────────────
-section "3/4  Starting FastAPI backend (:8000)"
+section "3/4  Starting FastAPI backend (:8001)"
 
 source "$VENV/bin/activate"
 
 cd "$ROOT"
 nohup uvicorn api.main:app \
   --host 0.0.0.0 \
-  --port 8000 \
+  --port 8001 \
   >> "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > "$BACKEND_PID_FILE"
@@ -94,7 +94,7 @@ info "Uvicorn started (PID $BACKEND_PID) → $BACKEND_LOG"
 info "Waiting for backend health check…"
 MAX_WAIT=30
 for i in $(seq 1 $MAX_WAIT); do
-  if curl -sf http://localhost:8000/health &>/dev/null; then
+  if curl -sf http://localhost:8001/health &>/dev/null; then
     ok "Backend healthy after ${i}s"
     break
   fi
@@ -105,7 +105,7 @@ for i in $(seq 1 $MAX_WAIT); do
 done
 
 # ── Step 4: Start Vite frontend ───────────────────────────────────────────────
-section "4/4  Starting Vite frontend (:5173)"
+section "4/4  Starting Vite frontend (:5174)"
 
 cd "$FRONTEND_DIR"
 nohup npm run dev \
@@ -117,7 +117,7 @@ info "Vite started (PID $FRONTEND_PID) → $FRONTEND_LOG"
 # Wait for frontend
 info "Waiting for frontend to be ready…"
 for i in $(seq 1 20); do
-  if curl -sf http://localhost:5173 &>/dev/null; then
+  if curl -sf http://localhost:5174 &>/dev/null; then
     ok "Frontend ready after ${i}s"
     break
   fi
@@ -129,9 +129,9 @@ echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e "${GREEN}${BOLD}  Application running${RESET}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "  Frontend :  ${CYAN}http://localhost:5173${RESET}"
-echo -e "  API       :  ${CYAN}http://localhost:8000${RESET}"
-echo -e "  API docs  :  ${CYAN}http://localhost:8000/docs${RESET}"
+echo -e "  Frontend :  ${CYAN}http://localhost:5174${RESET}"
+echo -e "  API       :  ${CYAN}http://localhost:8001${RESET}"
+echo -e "  API docs  :  ${CYAN}http://localhost:8001/docs${RESET}"
 echo -e "  Neo4j UI  :  ${CYAN}http://localhost:7474${RESET}"
 echo ""
 echo -e "  Backend log  : $BACKEND_LOG"

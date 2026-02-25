@@ -74,9 +74,9 @@ def main():
     console.print(Rule("[bold green]✓ Setup Complete[/]"))
     console.print(
         "\nStart the API server:\n"
-        "  [cyan]uvicorn api.main:app --reload --port 8000[/]\n"
+        "  [cyan]uvicorn api.main:app --reload --port 8001[/]\n"
         "\nOpen docs:\n"
-        "  http://localhost:8000/docs\n"
+        "  http://localhost:8001/docs\n"
         "\nOpen Neo4j browser:\n"
         "  http://localhost:7474  (user: neo4j / pass: amlpassword123)\n"
     )

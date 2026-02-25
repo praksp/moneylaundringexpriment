@@ -26,6 +26,7 @@ from db.models import TransactionOutcome, RiskScore, ModelScore, ChallengeQuesti
 from risk.features import extract_features, FeatureVector
 from risk.bayesian import compute_bayesian_score
 from ml.model import get_registry
+from api.cache import ttl_cache
 from config.settings import settings
 
 CHALLENGE_QUESTIONS = [
@@ -93,6 +94,52 @@ def _node_to_dict(node) -> dict:
     return dict(node)
 
 
+@ttl_cache(ttl=60, key_fn=lambda a, kw: f"vel_{kw.get('account_id', a[0] if a else '')}")
+def _get_velocity(account_id: str, txn_id: str, ts: str) -> dict:
+    from datetime import datetime, timedelta
+    try:
+        now = datetime.fromisoformat(ts.replace("Z", ""))
+    except Exception:
+        now = datetime.utcnow()
+    with neo4j_session() as session:
+        res = session.run(
+            VELOCITY_CYPHER,
+            account_id=account_id,
+            txn_id=txn_id,
+            ts=ts,
+            ts_1h=(now - timedelta(hours=1)).isoformat(),
+            ts_24h=(now - timedelta(hours=24)).isoformat(),
+            ts_7d=(now - timedelta(days=7)).isoformat(),
+        ).single()
+        return dict(res) if res else {"count_1h": 0, "count_24h": 0, "count_7d": 0, "total_24h": 0.0, "total_7d": 0.0, "structuring_24h": 0}
+
+
+@ttl_cache(ttl=300, key_fn=lambda a, kw: f"hop_{kw.get('account_id', a[0] if a else '')}")
+def _get_network_hops(account_id: str) -> int:
+    with neo4j_session() as session:
+        res = session.run(NETWORK_CYPHER, account_id=account_id).single()
+        return int(res.get("max_hops") or 1) if res else 1
+
+
+@ttl_cache(ttl=60, key_fn=lambda a, kw: f"dev_{kw.get('txn_id', a[0] if a else '')}")
+def _get_shared_device(txn_id: str) -> int:
+    with neo4j_session() as session:
+        res = session.run(SHARED_DEVICE_CYPHER, txn_id=txn_id).single()
+        return int(res.get("device_user_count") or 1) if res else 1
+
+
+@ttl_cache(ttl=60, key_fn=lambda a, kw: f"rt_{kw.get('account_id', a[0] if a else '')}")
+def _get_round_trip(account_id: str, ts: str) -> int:
+    from datetime import datetime, timedelta
+    try:
+        since_48h = (datetime.fromisoformat(ts.replace("Z", "")) - timedelta(hours=48)).isoformat()
+    except Exception:
+        since_48h = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+    with neo4j_session() as session:
+        res = session.run(ROUND_TRIP_CYPHER, account_id=account_id, since=since_48h).single()
+        return int(res.get("round_trip_count") or 0) if res else 0
+
+
 def _fetch_graph_context(txn_id: str) -> Optional[dict]:
     """Pull full graph context for a transaction ID."""
     with neo4j_session() as session:
@@ -106,52 +153,10 @@ def _fetch_graph_context(txn_id: str) -> Optional[dict]:
 
         ts = str(txn.get("timestamp", ""))
 
-        # Velocity
-        vel = {"count_1h": 0, "count_24h": 0, "count_7d": 0,
-               "total_24h": 0.0, "total_7d": 0.0, "structuring_24h": 0}
-        if sender.get("id"):
-            from datetime import datetime, timedelta
-            try:
-                now = datetime.fromisoformat(ts.replace("Z", ""))
-            except Exception:
-                now = datetime.utcnow()
-            vel_res = session.run(
-                VELOCITY_CYPHER,
-                account_id=sender["id"],
-                txn_id=txn_id,
-                ts=ts,
-                ts_1h=(now - timedelta(hours=1)).isoformat(),
-                ts_24h=(now - timedelta(hours=24)).isoformat(),
-                ts_7d=(now - timedelta(days=7)).isoformat(),
-            ).single()
-            if vel_res:
-                vel = dict(vel_res)
-
-        # Network hops
-        hop_count = 1
-        if sender.get("id"):
-            hop_res = session.run(NETWORK_CYPHER, account_id=sender["id"]).single()
-            if hop_res:
-                hop_count = int(hop_res.get("max_hops") or 1)
-
-        # Shared device
-        device_users = 1
-        device_res = session.run(SHARED_DEVICE_CYPHER, txn_id=txn_id).single()
-        if device_res:
-            device_users = int(device_res.get("device_user_count") or 1)
-
-        # Round-trip
-        rt_count = 0
-        if sender.get("id"):
-            from datetime import timedelta
-            try:
-                since_48h = (datetime.fromisoformat(ts.replace("Z", "")) - timedelta(hours=48)).isoformat()
-            except Exception:
-                from datetime import datetime
-                since_48h = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-            rt_res = session.run(ROUND_TRIP_CYPHER, account_id=sender["id"], since=since_48h).single()
-            if rt_res:
-                rt_count = int(rt_res.get("round_trip_count") or 0)
+        vel = _get_velocity(sender["id"], txn_id, ts) if sender.get("id") else {"count_1h": 0, "count_24h": 0, "count_7d": 0, "total_24h": 0.0, "total_7d": 0.0, "structuring_24h": 0}
+        hop_count = _get_network_hops(sender["id"]) if sender.get("id") else 1
+        device_users = _get_shared_device(txn_id)
+        rt_count = _get_round_trip(sender["id"], ts) if sender.get("id") else 0
 
         return {
             "txn": txn,

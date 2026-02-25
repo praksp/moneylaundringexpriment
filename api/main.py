@@ -28,7 +28,7 @@ from api.routes.auth import router as auth_router
 from api.routes.anomaly import router as anomaly_router
 from api.routes.graphsage import router as graphsage_router
 from api.routes.models import router as models_router
-from db.client import get_driver, close_driver
+from db.client import get_driver, close_driver, get_async_driver, close_async_driver
 from ml.model import get_model, get_registry
 from ml.anomaly import get_detector
 from config.settings import settings
@@ -65,6 +65,7 @@ def _background_warmup():
 async def lifespan(app: FastAPI):
     # Startup
     get_driver()            # Verify Neo4j connectivity
+    await get_async_driver() # Verify Async Neo4j connectivity
     get_model()             # Pre-load XGBoost (legacy)
     get_registry()          # Pre-load risk models (XGBoost + SVM)
     if settings.enable_knn_anomaly:
@@ -83,6 +84,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     close_driver()
+    await close_async_driver()
 
 
 app = FastAPI(
@@ -120,8 +122,8 @@ async def health_check():
     neo4j_ok = False
     neo4j_error = None
     try:
-        driver = get_driver()
-        driver.verify_connectivity()
+        driver = await get_async_driver()
+        await driver.verify_connectivity()
         neo4j_ok = True
     except Exception as e:
         neo4j_error = str(e)

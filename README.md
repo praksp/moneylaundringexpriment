@@ -382,7 +382,7 @@ python scripts/setup.py
 
 ### 4. Start the backend
 ```bash
-uvicorn api.main:app --reload --port 8000
+uvicorn api.main:app --reload --port 8001
 ```
 
 ### 5. Start the frontend
@@ -391,8 +391,8 @@ cd frontend && npm install && npm run dev
 ```
 
 ### 6. Open the app
-- **Frontend**: http://localhost:5173  (admin / password)
-- **API Swagger**: http://localhost:8000/docs
+- **Frontend**: http://localhost:5174  (admin / password)
+- **API Swagger**: http://localhost:8001/docs
 - **Neo4j Browser**: http://localhost:7474 (neo4j / amlpassword123)
 
 ### Restart everything
@@ -412,7 +412,7 @@ bash scripts/retrain_models.sh
 ### Incremental train (via API — fast delta only)
 ```bash
 # Trigger from the Model Monitor page, or:
-curl -X POST http://localhost:8000/models/train/incremental \
+curl -X POST http://localhost:8001/models/train/incremental \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"trigger":"manual","force":false,"auto_promote":true}'

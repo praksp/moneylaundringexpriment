@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15
+    container_name: aml_neo4j_prod
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt protocol
+    environment:
+      - NEO4J_AUTH=neo4j/amlpassword123
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+    volumes:
+      - neo4j_data_prod:/data
+      - neo4j_logs_prod:/logs
+      - neo4j_import_prod:/var/lib/neo4j/import
+    restart: unless-stopped
+
+  # FastAPI Backend (Python ML Service)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: aml_backend_prod
+    ports:
+      - "8001:8001"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=amlpassword123
+      - API_PORT=8001
+      - ENABLE_KNN_ANOMALY=true
+      - ENABLE_GRAPHSAGE=true
+    volumes:
+      - ./models_saved:/app/models_saved
+      - ./logs:/app/logs
+    depends_on:
+      - neo4j
+    restart: unless-stopped
+
+  # React Frontend (Nginx Server)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: aml_frontend_prod
+    ports:
+      - "5174:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  neo4j_data_prod:
+  neo4j_logs_prod:
+  neo4j_import_prod:

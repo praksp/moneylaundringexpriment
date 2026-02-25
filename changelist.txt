@@ -334,3 +334,41 @@ Risk scoring:
 Fraud patterns in seed data:
   Structuring (~15), Smurfing (~16), Layering (~16), Round-tripping (~10),
   Dormant Burst (~15), High-Risk Corridor (~15), Rapid Velocity (~30)
+
+================================================================================
+Phase 7 (Develop Branch): Performance, Scalability & Docker Optimizations
+================================================================================
+
+1. Side-by-Side Execution
+  - Changed API port to 8001 (from 8000)
+  - Changed Vite dev server port to 5174 (from 5173)
+  - Allows the develop branch to run concurrently with the main branch.
+
+2. Async Neo4j Driver Migration
+  - Updated `db/client.py` to expose `AsyncGraphDatabase` and `async_neo4j_session`.
+  - Migrated `api/routes/transactions.py` and `api/main.py` health checks to use
+    the non-blocking async driver, preventing thread pool starvation under load.
+
+3. Cursor-based Pagination
+  - Updated `GET /transactions/` to accept a `cursor` (timestamp) parameter.
+  - Replaced O(N) `SKIP/LIMIT` degradation with indexed timestamp comparisons.
+
+4. Push-Down Drift Computation
+  - Modified `monitoring/drift.py` to compute PSI histogram buckets directly inside
+    Cypher queries rather than loading millions of final_scores into Python memory.
+
+5. Real-Time Feature Caching
+  - Extracted graph queries (velocity, network hops, shared devices, round trips)
+    in `risk/engine.py` into helper functions.
+  - Wrapped helpers with `@ttl_cache(ttl=60)` to cache account-level stats,
+    drastically dropping DB load for real-time evaluations.
+
+6. Frontend Code-Splitting
+  - Wrapped React Router routes in `React.lazy()` and `<Suspense>` in `App.tsx`.
+  - Reduced main chunk size to resolve Vite "> 500kb" warnings.
+
+7. Dockerization
+  - Created `Dockerfile.backend` (FastAPI + uvicorn).
+  - Created `Dockerfile.frontend` (multi-stage build with Nginx API proxy).
+  - Created `docker-compose.prod.yml` to orchestrate Neo4j, backend, and frontend
+    as a complete production stack.

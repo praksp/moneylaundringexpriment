@@ -3,12 +3,12 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page
 
-BASE = "http://localhost:5173"
+BASE = "http://localhost:5174"
 OUT  = Path("screenshots")
 VIEWPORT = {"width": 1440, "height": 900}
 
 
-def wait_idle(page: Page, timeout=8000):
+def wait_idle(page: Page, timeout=8001):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
@@ -35,7 +35,7 @@ def run():
         page.fill("input[type='text']", "admin")
         page.fill("input[type='password']", "password")
         page.click("button[type='submit']")
-        wait_idle(page, 8000)
+        wait_idle(page, 8001)
         time.sleep(2)
         print("Logged in")
 
@@ -88,7 +88,7 @@ def run():
             print(f"  Found {cnt} customer rows")
             if cnt > 0:
                 rows.first.click(timeout=5000)
-                wait_idle(page, 8000)
+                wait_idle(page, 8001)
                 time.sleep(3)
                 ss(page, "customer-detail.png", extra_wait=1)
         except Exception as e:
@@ -123,7 +123,7 @@ def run():
         # ── Submit transaction + result ───────────────────────────────────────
         print("Submit transaction result...")
         page.goto(f"{BASE}/transactions/new", wait_until="domcontentloaded")
-        wait_idle(page, 8000)
+        wait_idle(page, 8001)
         time.sleep(2)
         ss(page, "submit-transaction.png")
 

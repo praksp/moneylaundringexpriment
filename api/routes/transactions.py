@@ -1,16 +1,16 @@
 """Transaction management routes."""
 from fastapi import APIRouter, HTTPException, Query, Depends
-from db.client import neo4j_session
+from db.client import neo4j_session, async_neo4j_session
 from auth.dependencies import require_viewer_or_admin
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
 LIST_QUERY = """
 MATCH (sender:Account)-[:INITIATED]->(t:Transaction)
+WHERE ($cursor IS NULL OR t.timestamp < $cursor)
 OPTIONAL MATCH (t)-[:CREDITED_TO]->(receiver:Account)
 RETURN t, sender.id AS sender_id, receiver.id AS receiver_id
 ORDER BY t.timestamp DESC
-SKIP $skip LIMIT $limit
 """
 
 COUNT_QUERY = "MATCH ()-[:INITIATED]->(t:Transaction) RETURN count(t) AS total"
@@ -72,6 +72,7 @@ async def transaction_stats():
 async def list_transactions(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
+    cursor: str = Query(default=None, description="Cursor timestamp for faster pagination"),
     fraud_only: bool = Query(default=False),
 ):
     """List transactions stored in the graph (paginated)."""
@@ -80,28 +81,43 @@ async def list_transactions(
         query = query.replace("MATCH (sender:Account)-[:INITIATED]->(t:Transaction)",
                               "MATCH (sender:Account)-[:INITIATED]->(t:Transaction {is_fraud: true})")
 
-    with neo4j_session() as session:
-        result = session.run(query, skip=skip, limit=limit)
-        records = [dict(r) for r in result]
-        count_res = session.run(COUNT_QUERY).single()
+    # If using legacy 'skip', append it. Always append limit.
+    if cursor is None and skip > 0:
+        query += " SKIP $skip"
+    query += " LIMIT $limit"
+
+    async with async_neo4j_session() as session:
+        result = await session.run(query, skip=skip, limit=limit, cursor=cursor)
+        records = [dict(r) async for r in result]
+        count_res_raw = await session.run(COUNT_QUERY)
+        count_res = await count_res_raw.single()
         total = count_res["total"] if count_res else 0
 
     transactions = []
+    next_cursor = None
     for r in records:
         txn = dict(r["t"])
         txn["sender_id"] = r.get("sender_id")
         txn["receiver_id"] = r.get("receiver_id")
         transactions.append(txn)
+        next_cursor = txn.get("timestamp")
 
-    return {"total": total, "skip": skip, "limit": limit, "transactions": transactions}
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "transactions": transactions
+    }
 
 
 @router.get("/{txn_id}")
 async def get_transaction(txn_id: str):
     """Get full transaction details including graph context."""
-    with neo4j_session() as session:
-        result = session.run(GET_QUERY, txn_id=txn_id)
-        record = result.single()
+    async with async_neo4j_session() as session:
+        result = await session.run(GET_QUERY, txn_id=txn_id)
+        record = await result.single()
 
     if record is None:
         raise HTTPException(status_code=404, detail=f"Transaction {txn_id} not found")

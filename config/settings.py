@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     neo4j_database: str = Field(default="neo4j", alias="NEO4J_DATABASE")
 
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
-    api_port: int = Field(default=8000, alias="API_PORT")
+    api_port: int = Field(default=8001, alias="API_PORT")
     debug: bool = Field(default=True, alias="DEBUG")
 
     risk_allow_max: int = Field(default=399, alias="RISK_ALLOW_MAX")

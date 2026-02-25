@@ -1,16 +1,19 @@
+import React, { Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import Layout from './components/Layout'
 import Login from './pages/Login'
-import Dashboard from './pages/Dashboard'
-import SubmitTransaction from './pages/SubmitTransaction'
-import CustomerProfiles from './pages/CustomerProfiles'
-import FeatureStore from './pages/FeatureStore'
-import ModelMonitor from './pages/ModelMonitor'
-import Overview from './pages/Overview'
-import AnomalyDetection from './pages/AnomalyDetection'
-import GraphSAGEDetection from './pages/GraphSAGEDetection'
+
+// Route-level code splitting
+const Dashboard = React.lazy(() => import('./pages/Dashboard'))
+const SubmitTransaction = React.lazy(() => import('./pages/SubmitTransaction'))
+const CustomerProfiles = React.lazy(() => import('./pages/CustomerProfiles'))
+const FeatureStore = React.lazy(() => import('./pages/FeatureStore'))
+const ModelMonitor = React.lazy(() => import('./pages/ModelMonitor'))
+const Overview = React.lazy(() => import('./pages/Overview'))
+const AnomalyDetection = React.lazy(() => import('./pages/AnomalyDetection'))
+const GraphSAGEDetection = React.lazy(() => import('./pages/GraphSAGEDetection'))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -58,27 +61,67 @@ function AppRoutes() {
         }
       >
         {/* All authenticated users */}
-        <Route index element={<Dashboard />} />
-        <Route path="submit" element={<SubmitTransaction />} />
-        <Route path="overview" element={<Overview />} />
-        <Route path="monitor" element={<ModelMonitor />} />
+        <Route index element={
+          <Suspense fallback={<div className="p-8 text-slate-400">Loading Dashboard...</div>}>
+            <Dashboard />
+          </Suspense>
+        } />
+        <Route path="submit" element={
+          <Suspense fallback={<div className="p-8 text-slate-400">Loading Form...</div>}>
+            <SubmitTransaction />
+          </Suspense>
+        } />
+        <Route path="overview" element={
+          <Suspense fallback={<div className="p-8 text-slate-400">Loading Overview...</div>}>
+            <Overview />
+          </Suspense>
+        } />
+        <Route path="monitor" element={
+          <Suspense fallback={<div className="p-8 text-slate-400">Loading Monitor...</div>}>
+            <ModelMonitor />
+          </Suspense>
+        } />
 
         {/* Admin-only */}
         <Route
           path="customers"
-          element={<RequireAdmin><CustomerProfiles /></RequireAdmin>}
+          element={
+            <RequireAdmin>
+              <Suspense fallback={<div className="p-8 text-slate-400">Loading Profiles...</div>}>
+                <CustomerProfiles />
+              </Suspense>
+            </RequireAdmin>
+          }
         />
         <Route
           path="features"
-          element={<RequireAdmin><FeatureStore /></RequireAdmin>}
+          element={
+            <RequireAdmin>
+              <Suspense fallback={<div className="p-8 text-slate-400">Loading Feature Store...</div>}>
+                <FeatureStore />
+              </Suspense>
+            </RequireAdmin>
+          }
         />
         <Route
           path="anomaly"
-          element={<RequireAdmin><AnomalyDetection /></RequireAdmin>}
+          element={
+            <RequireAdmin>
+              <Suspense fallback={<div className="p-8 text-slate-400">Loading Anomaly Detection...</div>}>
+                <AnomalyDetection />
+              </Suspense>
+            </RequireAdmin>
+          }
         />
         <Route
           path="graphsage"
-          element={<RequireAdmin><GraphSAGEDetection /></RequireAdmin>}
+          element={
+            <RequireAdmin>
+              <Suspense fallback={<div className="p-8 text-slate-400">Loading GraphSAGE...</div>}>
+                <GraphSAGEDetection />
+              </Suspense>
+            </RequireAdmin>
+          }
         />
       </Route>
 

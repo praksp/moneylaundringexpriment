@@ -52,10 +52,16 @@ def _score_distribution(scores: list[int]) -> np.ndarray:
     return hist.astype(float) / max(hist.sum(), 1)
 
 
-def compute_score_psi(reference_scores: list[int], current_scores: list[int]) -> dict:
+def compute_score_psi(reference_scores: list[int], current_scores: dict) -> dict:
     """Compare score distributions via PSI."""
     ref_dist = _score_distribution(reference_scores)
-    cur_dist = _score_distribution(current_scores)
+    
+    if current_scores["count"] > 0:
+        cur_dist = current_scores["hist"]
+        cur_dist = cur_dist / max(cur_dist.sum(), 1)
+    else:
+        cur_dist = np.ones(10) / 10
+        
     psi_val = _psi(ref_dist, cur_dist)
 
     return {
@@ -125,15 +131,44 @@ def _alert_level(psi: float) -> str:
     return "CRITICAL"
 
 
-def fetch_recent_prediction_scores(hours_back: int = 168) -> list[int]:
-    """Pull final_score from recent PredictionLog entries."""
+def fetch_recent_prediction_scores(hours_back: int = 168) -> dict:
+    """
+    Pull final_score distribution and stats from recent PredictionLog entries
+    directly via Cypher to avoid OOM on millions of rows.
+    """
     since = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat()
     with neo4j_session() as session:
         records = list(session.run("""
-            MATCH (pl:PredictionLog) WHERE pl.timestamp >= $since
-            RETURN pl.final_score AS score
+            MATCH (pl:PredictionLog) WHERE pl.timestamp >= $since AND pl.final_score IS NOT NULL
+            WITH count(pl) AS total_count, avg(pl.final_score) AS avg_score, pl
+            WITH total_count, avg_score,
+                 CASE
+                   WHEN pl.final_score <= 100 THEN 0
+                   WHEN pl.final_score <= 200 THEN 1
+                   WHEN pl.final_score <= 300 THEN 2
+                   WHEN pl.final_score <= 400 THEN 3
+                   WHEN pl.final_score <= 500 THEN 4
+                   WHEN pl.final_score <= 600 THEN 5
+                   WHEN pl.final_score <= 700 THEN 6
+                   WHEN pl.final_score <= 800 THEN 7
+                   WHEN pl.final_score <= 900 THEN 8
+                   ELSE 9
+                 END AS bucket
+            RETURN total_count, avg_score, bucket, count(pl) AS bucket_count
+            ORDER BY bucket
         """, since=since))
-    return [int(r["score"]) for r in records if r["score"] is not None]
+
+    if not records:
+        return {"count": 0, "avg_score": 0.0, "hist": np.zeros(10)}
+
+    total_count = records[0]["total_count"]
+    avg_score = records[0]["avg_score"] or 0.0
+    hist = np.zeros(10)
+    for r in records:
+        if r["bucket"] is not None:
+            hist[int(r["bucket"])] = float(r["bucket_count"])
+
+    return {"count": total_count, "avg_score": avg_score, "hist": hist}
 
 
 def fetch_recent_feature_vectors(hours_back: int = 168) -> list[list[float]]:
@@ -178,7 +213,7 @@ def compute_and_store_drift_report(
     current_vectors = fetch_recent_feature_vectors(evaluation_hours)
     current_outcomes = fetch_outcome_distribution(evaluation_hours)
 
-    score_drift = compute_score_psi(reference_scores, current_scores) if current_scores else {
+    score_drift = compute_score_psi(reference_scores, current_scores) if current_scores["count"] > 0 else {
         "psi": 0.0, "alert_level": "OK",
         "reference_distribution": {}, "current_distribution": {},
     }
@@ -210,7 +245,7 @@ def compute_and_store_drift_report(
         "computed_at": datetime.utcnow().isoformat(),
         "evaluation_window_hours": evaluation_hours,
         "reference_sample_size": len(reference_scores),
-        "current_sample_size": len(current_scores),
+        "current_sample_size": current_scores["count"],
         "score_distribution_psi": score_drift["psi"],
         "score_alert_level": score_drift["alert_level"],
         "max_feature_psi": round(max_psi, 4),
@@ -315,7 +350,7 @@ def _explain_drift_causes(
     feature_drift: dict,
     current_outcomes: dict,
     reference_scores: list[int],
-    current_scores: list[int],
+    current_scores: dict,
     top_drifted: list[tuple],
 ) -> list[dict]:
     """
@@ -325,9 +360,9 @@ def _explain_drift_causes(
     causes: list[dict] = []
 
     # ── Score distribution shift ───────────────────────────────────────────────
-    if score_drift["psi"] >= PSI_WARNING_THRESHOLD and current_scores and reference_scores:
+    if score_drift["psi"] >= PSI_WARNING_THRESHOLD and current_scores["count"] > 0 and reference_scores:
         ref_avg = float(np.mean(reference_scores))
-        cur_avg = float(np.mean(current_scores))
+        cur_avg = current_scores["avg_score"]
         delta   = cur_avg - ref_avg
         direction = "higher" if delta > 0 else "lower"
         causes.append({

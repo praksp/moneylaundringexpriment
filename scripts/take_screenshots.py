@@ -1,21 +1,21 @@
 """
 scripts/take_screenshots.py
 Captures screenshots of every UI page for the AML application.
-Run from the project root with the API (port 8000) and frontend (port 5173) running:
+Run from the project root with the API (port 8001) and frontend (port 5174) running:
     python scripts/take_screenshots.py
 """
 import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page
 
-BASE = "http://localhost:5173"
+BASE = "http://localhost:5174"
 OUT  = Path("screenshots")
 OUT.mkdir(exist_ok=True)
 
 VIEWPORT = {"width": 1440, "height": 900}
 
 
-def wait_network_idle(page: Page, timeout: int = 8000):
+def wait_network_idle(page: Page, timeout: int = 8001):
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
@@ -67,7 +67,7 @@ def run():
         # ── 3. Submit Transaction ─────────────────────────────────────────────
         print("3. Submit Transaction...")
         page.goto(f"{BASE}/transactions/new", wait_until="domcontentloaded")
-        wait_network_idle(page, 8000)
+        wait_network_idle(page, 8001)
         time.sleep(2)
         # Fill in a sample transaction
         try:
@@ -114,7 +114,7 @@ def run():
         try:
             first_customer = page.locator("tbody tr, [data-customer], button[data-id]").first
             first_customer.click(timeout=3000)
-            wait_network_idle(page, 8000)
+            wait_network_idle(page, 8001)
             time.sleep(3)
             ss(page, "customer-detail.png")
         except Exception as e:
