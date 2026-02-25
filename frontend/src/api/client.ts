@@ -467,6 +467,7 @@ export interface GraphSAGESummary {
 
 export interface GraphSAGEFeature {
   name: string
+  pattern: string
   value: number | string
   unit: string
   threshold: number | string
@@ -516,10 +517,16 @@ export interface GraphSAGEAccountDetail {
     pattern_count: number
     pass_through: number
     unique_senders: number
+    unique_receivers: number
+    sender_diversity: number
+    funnel_concentration: number
+    net_retention_pct: number
     out_volume_usd: number
     in_volume_usd: number
     out_txn_count: number
     in_txn_count: number
+    triggered_patterns: string[]
+    is_structural_mule: boolean
   }
   fraud_transactions: GraphSAGEFraudTxn[]
   fraud_txn_count: number

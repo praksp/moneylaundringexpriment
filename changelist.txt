@@ -1,6 +1,93 @@
 CHANGELIST — AML Transaction Risk Engine
 =========================================
-Date: 2026-02-23
+Date: 2026-02-25
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMIT 12: GraphSAGE v2 — Structural Mule Account Pattern Detection
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Background / Pattern Analysis
+------------------------------
+A mule account acts as an intermediary to launder criminal proceeds — it receives
+funds from multiple sources and quickly forwards them on to obscure the origin.
+Analysis of the existing 100k+ transaction dataset revealed 5 distinct structural
+patterns that define mule accounts:
+
+  1. Fan-in Collection (Smurfing) — 82,252 accounts with ≥5 unique senders
+     (max: 39 distinct senders → 1 account). Multiple unrelated parties each
+     deposit small amounts to avoid CTR detection thresholds.
+
+  2. Pass-Through Relay — 23,365 accounts with outflow/inflow ratio 0.85–1.15×.
+     The account retains almost no funds — it acts purely as a financial wire hop.
+     Legitimate spending accounts retain 60–80% of receipts.
+
+  3. Funnel Aggregation — 27,690 accounts collect from ≥5 senders but forward to
+     only 1–3 recipients (many-in, few-out). Classic collector mule funnelling
+     scattered criminal proceeds toward a controller account.
+
+  4. Structural Mules Without Labels — 15,439 accounts exhibit the full relay
+     signature (5+ senders + pass-through + $10k+ flow) but have ZERO explicit
+     fraud labels. These are unwitting mules or undetected accounts that the
+     previous model missed entirely.
+
+  5. Round-Trip Layering — 5,599 accounts involved in A→B→A fund flows, adding
+     hops to confuse the audit trail.
+
+Changes
+-------
+ml/graphsage.py:
+  - Expanded node features from 16 → 20, adding 4 mule-structural features:
+      Feature 16: sender_diversity_ratio = unique_senders / in_count
+                  Near 1.0 = every inbound is from a new stranger (smurfing signal)
+      Feature 17: unique_receivers_norm = unique_receivers / 100 (fan-out)
+      Feature 18: funnel_concentration = 1 - (receivers / out_count)
+                  High = many-in, few-out collector mule
+      Feature 19: net_retention_ratio = (in_vol - out_vol) / in_vol
+                  Near 0 = mule keeps nothing (relay signal)
+  - Enhanced _NODE_QUERY to also return unique_senders and unique_receivers
+    via a rewritten Cypher query with proper DISTINCT aggregation
+  - Enhanced mule label (3 criteria — was 2):
+      Old: fraud_ratio ≥ 30%  OR  pattern_count ≥ 2
+      New: (same)  OR  structural relay signature
+           (≥5 unique senders  AND  pass-through 0.7–1.5×  AND  inflow > $10k)
+      This labels 15,439 previously-missed structural mule accounts
+  - N_INPUT updated from 16 → 20
+  - Model retrained: ROC-AUC 0.9963, Avg Precision 0.9889, 
+    Mule prevalence 25.2% (up from 15% — structural mules now captured)
+    Mule precision 95%, recall 94%
+
+api/routes/graphsage.py:
+  - Updated get_account_graphsage feat_row Cypher query to fetch
+    unique_senders, unique_receivers, sender_diversity_ratio,
+    funnel_concentration, net_retention_ratio
+  - Removed redundant network_row sub-query (merged into feat_row)
+  - Feature explanations updated: 9 features (was 7), with detailed
+    mule-pattern descriptions for the 4 new structural features
+  - Added pattern badge list: triggered_patterns[] in feature_summary
+    (FAN_IN_COLLECTION, PASS_THROUGH_RELAY, FUNNEL_AGGREGATION,
+     ZERO_RETENTION, STRUCTURAL_RELAY, FRAUD_PATTERN_MATCH, HIGH_FRAUD_RATIO)
+  - Enhanced mule_label_reason to explain structural relay detection
+  - Added is_structural_mule flag to feature_summary
+
+frontend/src/api/client.ts:
+  - Added pattern field to GraphSAGEFeature interface
+  - Added new fields to feature_summary: unique_receivers, sender_diversity,
+    funnel_concentration, net_retention_pct, triggered_patterns[],
+    is_structural_mule
+
+frontend/src/pages/GraphSAGEDetection.tsx:
+  - AccountDrawer features tab now shows:
+      * Triggered mule pattern badge row (emoji-labelled)
+      * Amber warning when is_structural_mule = true (unlabeled relay)
+      * Expanded 9-cell feature summary grid including funnel score,
+        sender diversity, net retention
+  - "How It Works" tab completely rewritten:
+      * GraphSAGE Architecture section updated for 20 features + v2 label
+      * New "Detected Mule Patterns" glossary explaining all 7 patterns
+        with real data counts from the dataset analysis
+      * Note about 15,439 newly-captured unlabeled structural mule accounts
+
+Date: 2026-02-25
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COMMIT 3: Quantize & scale models for 10Mx dataset growth

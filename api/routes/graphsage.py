@@ -193,28 +193,40 @@ async def get_account_graphsage(account_id: str):
         if row is None:
             raise HTTPException(404, "Account not found")
 
-        # ── Feature vector used by GraphSAGE ─────────────────────────────────
+        # ── Feature vector used by GraphSAGE (all 20 features) ───────────────
         feat_row = s.run("""
             MATCH (a:Account {id: $id})
-            OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
-            OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+            OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)-[:CREDITED_TO]->(recv:Account)
             WITH a,
-              count(DISTINCT t_out)                                          AS out_count,
-              coalesce(sum(t_out.amount_usd), 0)                             AS out_vol,
-              count(DISTINCT t_in)                                           AS in_count,
-              coalesce(sum(t_in.amount_usd), 0)                              AS in_vol,
-              coalesce(avg(t_out.amount_usd), 0)                             AS avg_out,
-              coalesce(sum(CASE WHEN t_out.is_fraud THEN 1 ELSE 0 END), 0)  AS fraud_count,
+              count(DISTINCT t_out)                                              AS out_count,
+              coalesce(sum(t_out.amount_usd), 0)                                AS out_vol,
+              coalesce(avg(t_out.amount_usd), 0)                                AS avg_out,
+              coalesce(sum(CASE WHEN t_out.is_fraud THEN 1 ELSE 0 END), 0)     AS fraud_count,
               coalesce(sum(CASE WHEN t_out.fraud_type IN
                 ['SMURFING','LAYERING','STRUCTURING','ROUND_TRIP',
                  'DORMANT_BURST','HIGH_RISK_CORRIDOR','RAPID_VELOCITY']
-                THEN 1 ELSE 0 END), 0)                                       AS pattern_count
+                THEN 1 ELSE 0 END), 0)                                          AS pattern_count,
+              count(DISTINCT recv)                                               AS unique_receivers
+            OPTIONAL MATCH (sender:Account)-[:INITIATED]->(t_in:Transaction)-[:CREDITED_TO]->(a)
+            WITH a, out_count, out_vol, avg_out, fraud_count, pattern_count, unique_receivers,
+              count(DISTINCT t_in)                                              AS in_count,
+              coalesce(sum(t_in.amount_usd), 0)                                AS in_vol,
+              count(DISTINCT sender)                                            AS unique_senders
             RETURN out_count, out_vol, in_count, in_vol, avg_out,
-                   fraud_count, pattern_count,
+                   fraud_count, pattern_count, unique_senders, unique_receivers,
                    CASE WHEN out_count > 0 THEN toFloat(fraud_count) / out_count ELSE 0 END
                        AS fraud_ratio,
                    CASE WHEN in_vol > 100 THEN out_vol / in_vol ELSE 0 END
-                       AS pass_through_ratio
+                       AS pass_through_ratio,
+                   // Fan-in diversity: near 1 = every sender is new (smurfing signal)
+                   CASE WHEN in_count > 0 THEN toFloat(unique_senders) / in_count ELSE 0 END
+                       AS sender_diversity_ratio,
+                   // Funnel concentration: 1 - recv/out = high when sending to few recipients
+                   CASE WHEN out_count > 0 THEN 1.0 - toFloat(unique_receivers) / out_count ELSE 0 END
+                       AS funnel_concentration,
+                   // Net retention: how much of inflow stays (mule keeps near 0)
+                   CASE WHEN in_vol > 0 THEN (in_vol - out_vol) / in_vol ELSE 1 END
+                       AS net_retention_ratio
         """, id=account_id).single()
 
         # ── Fraud & high-risk transactions ────────────────────────────────────
@@ -258,24 +270,22 @@ async def get_account_graphsage(account_id: str):
             LIMIT 20
         """, id=account_id).data()
 
-        # ── Unique senders (30d context) ──────────────────────────────────────
-        network_row = s.run("""
-            MATCH (sender:Account)-[:INITIATED]->(t:Transaction)-[:CREDITED_TO]->(a:Account {id: $id})
-            RETURN count(DISTINCT sender) AS unique_senders
-        """, id=account_id).single()
-
     # ── Build feature explanation ──────────────────────────────────────────────
     fv = feat_row or {}
-    out_count      = int(fv.get("out_count") or 0)
-    in_count       = int(fv.get("in_count") or 0)
-    out_vol        = float(fv.get("out_vol") or 0)
-    in_vol         = float(fv.get("in_vol") or 0)
-    fraud_count    = int(fv.get("fraud_count") or 0)
-    pattern_count  = int(fv.get("pattern_count") or 0)
-    fraud_ratio    = float(fv.get("fraud_ratio") or 0)
-    pass_thru      = float(fv.get("pass_through_ratio") or 0)
-    avg_out        = float(fv.get("avg_out") or 0)
-    unique_senders = int((network_row or {}).get("unique_senders") or 0)
+    out_count        = int(fv.get("out_count")  or 0)
+    in_count         = int(fv.get("in_count")   or 0)
+    out_vol          = float(fv.get("out_vol")  or 0)
+    in_vol           = float(fv.get("in_vol")   or 0)
+    fraud_count      = int(fv.get("fraud_count") or 0)
+    pattern_count    = int(fv.get("pattern_count") or 0)
+    fraud_ratio      = float(fv.get("fraud_ratio") or 0)
+    pass_thru        = float(fv.get("pass_through_ratio") or 0)
+    avg_out          = float(fv.get("avg_out") or 0)
+    unique_senders   = int(fv.get("unique_senders") or 0)
+    unique_receivers = int(fv.get("unique_receivers") or 0)
+    sender_div       = float(fv.get("sender_diversity_ratio") or 0)
+    funnel_conc      = float(fv.get("funnel_concentration") or 0)
+    net_retention    = float(fv.get("net_retention_ratio") or 1.0)
 
     _COUNTRY_RISK = {
         "IR": 1.0, "KP": 1.0, "SY": 1.0, "RU": 0.8, "MM": 0.8, "VE": 0.8,
@@ -284,70 +294,147 @@ async def get_account_graphsage(account_id: str):
     }
     country_risk = _COUNTRY_RISK.get(str(row.get("account_country") or ""), 0.0)
 
+    # Structural mule check (mirrors the training label)
+    structural_mule = (unique_senders >= 5 and 0.7 <= pass_thru <= 1.5 and in_vol > 10_000)
+
+    # Pattern names — for UI badge display
+    triggered_patterns: list[str] = []
+    if fraud_ratio >= 0.30:         triggered_patterns.append("HIGH_FRAUD_RATIO")
+    if pattern_count >= 2:          triggered_patterns.append("FRAUD_PATTERN_MATCH")
+    if structural_mule:             triggered_patterns.append("STRUCTURAL_RELAY")
+    if unique_senders >= 5:         triggered_patterns.append("FAN_IN_COLLECTION")
+    if 0.7 <= pass_thru <= 1.5 and in_vol > 1000:
+                                    triggered_patterns.append("PASS_THROUGH_RELAY")
+    if funnel_conc >= 0.7 and unique_senders >= 5:
+                                    triggered_patterns.append("FUNNEL_AGGREGATION")
+    if net_retention < 0.15 and in_vol > 5000:
+                                    triggered_patterns.append("ZERO_RETENTION")
+
     # Each feature: name, value, threshold, triggered (bool), weight %, description
+    # Ordered by GraphSAGE feature importance (empirical from training weights norm)
     features = [
+        # ── Explicit fraud signals ──────────────────────────────────────────────
         {
             "name": "Fraud Transaction Ratio",
+            "pattern": "HIGH_FRAUD_RATIO",
             "value": round(fraud_ratio * 100, 1),
             "unit": "%",
             "threshold": 30.0,
             "triggered": fraud_ratio >= 0.30,
-            "weight_pct": 25,
-            "description": f"{fraud_count} of {out_count} outbound transactions are fraud",
+            "weight_pct": 22,
+            "description": (
+                f"{fraud_count} of {out_count} outbound transactions are explicitly "
+                f"marked fraud ({fraud_ratio*100:.1f}%). Threshold: ≥30%."
+            ),
         },
         {
             "name": "Fraud Pattern Count",
+            "pattern": "FRAUD_PATTERN_MATCH",
             "value": pattern_count,
             "unit": "txns",
             "threshold": 2,
             "triggered": pattern_count >= 2,
-            "weight_pct": 20,
-            "description": "SMURFING / LAYERING / STRUCTURING / ROUND_TRIP patterns detected",
+            "weight_pct": 18,
+            "description": (
+                "Transactions tagged with a fraud typology: SMURFING, LAYERING, "
+                "STRUCTURING, ROUND_TRIP, DORMANT_BURST, HIGH_RISK_CORRIDOR, or "
+                "RAPID_VELOCITY. Two or more confirms pattern membership."
+            ),
+        },
+        # ── NEW mule-structural signals ─────────────────────────────────────────
+        {
+            "name": "Fan-in Sender Diversity",
+            "pattern": "FAN_IN_COLLECTION",
+            "value": unique_senders,
+            "unit": " senders",
+            "threshold": 5,
+            "triggered": unique_senders >= 5,
+            "weight_pct": 18,
+            "description": (
+                f"{unique_senders} distinct accounts have sent money INTO this account. "
+                "A legitimate account (salary, vendor payments) has 1–3 known senders. "
+                "≥5 unrelated senders is the hallmark of a SMURFING COLLECTION POINT — "
+                "many participants each deposit small amounts to avoid detection thresholds."
+            ),
         },
         {
-            "name": "Pass-Through Ratio",
+            "name": "Pass-Through Relay Ratio",
+            "pattern": "PASS_THROUGH_RELAY",
             "value": round(pass_thru, 2),
             "unit": "×",
-            "threshold": 0.7,
-            "triggered": 0.7 <= pass_thru <= 5.0 and in_vol > 1000,
+            "threshold": "0.7–1.5",
+            "triggered": 0.7 <= pass_thru <= 1.5 and in_vol > 1_000,
             "weight_pct": 16,
-            "description": f"Outflow ÷ Inflow = {pass_thru:.2f}×  (mule accounts relay funds)",
+            "description": (
+                f"Outflow ÷ Inflow = {pass_thru:.2f}×. A ratio near 1.0 means the account "
+                "receives money and forwards almost all of it — it keeps no funds. "
+                "This is the defining characteristic of a RELAY/MULE ACCOUNT. "
+                "Normal spending accounts retain 60–80% of inflows."
+            ),
         },
         {
-            "name": "Unique Senders (all-time)",
-            "value": unique_senders,
-            "unit": "accounts",
-            "threshold": 10,
-            "triggered": unique_senders > 10,
-            "weight_pct": 15,
-            "description": "High sender diversity indicates smurfing / layering from many sources",
+            "name": "Funnel Concentration",
+            "pattern": "FUNNEL_AGGREGATION",
+            "value": round(funnel_conc * 100, 1),
+            "unit": "%",
+            "threshold": 70.0,
+            "triggered": funnel_conc >= 0.7 and unique_senders >= 5,
+            "weight_pct": 12,
+            "description": (
+                f"Sends to only {unique_receivers} distinct recipients across {out_count} "
+                f"outbound transactions ({round(funnel_conc*100,1)}% concentration). "
+                "Many-in + few-out is the FUNNEL AGGREGATION pattern: the mule collects "
+                "scattered criminal proceeds and channels them to a controller account."
+            ),
         },
+        {
+            "name": "Net Balance Retention",
+            "pattern": "ZERO_RETENTION",
+            "value": round(net_retention * 100, 1),
+            "unit": "%",
+            "threshold": 15.0,
+            "triggered": net_retention < 0.15 and in_vol > 5_000,
+            "weight_pct": 8,
+            "description": (
+                f"Only {round(net_retention*100,1)}% of inbound funds are retained. "
+                "A mule account acts as a financial wire — money flows straight through "
+                "with negligible balance accumulation. Legitimate accounts accumulate savings."
+            ),
+        },
+        # ── Identity / jurisdiction signals ─────────────────────────────────────
         {
             "name": "Outbound Volume",
+            "pattern": "HIGH_VOLUME",
             "value": round(out_vol, 0),
-            "unit": "USD",
+            "unit": " USD",
             "threshold": 100_000,
             "triggered": out_vol > 100_000,
-            "weight_pct": 12,
-            "description": f"${out_vol:,.0f} total outbound  |  ${avg_out:,.0f} avg per txn",
+            "weight_pct": 4,
+            "description": f"${out_vol:,.0f} total outbound  |  ${avg_out:,.0f} avg per transaction.",
         },
         {
             "name": "Country Risk",
+            "pattern": "HIGH_RISK_JURISDICTION",
             "value": round(country_risk * 100, 0),
             "unit": "/100",
             "threshold": 30.0,
             "triggered": country_risk >= 0.3,
-            "weight_pct": 7,
-            "description": f"Account registered in high-risk jurisdiction ({row.get('account_country') or 'unknown'})",
+            "weight_pct": 1,
+            "description": (
+                f"Account registered in {row.get('account_country') or 'unknown'}. "
+                "Jurisdictions with weak AML controls, FATF grey/blacklist status, "
+                "or known financial secrecy laws increase the risk score."
+            ),
         },
         {
             "name": "PEP / Sanctions Flag",
+            "pattern": "PEP_SANCTIONS",
             "value": "YES" if (row.get("pep_flag") or row.get("sanctions_flag")) else "NO",
             "unit": "",
             "threshold": "YES",
             "triggered": bool(row.get("pep_flag") or row.get("sanctions_flag")),
-            "weight_pct": 5,
-            "description": "Politically Exposed Person or sanctions watchlist match",
+            "weight_pct": 1,
+            "description": "Politically Exposed Person or sanctions watchlist match on the account owner.",
         },
     ]
 
@@ -384,12 +471,19 @@ async def get_account_graphsage(account_id: str):
     all_txns.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
 
     triggered_features = [f for f in features if f["triggered"]]
-    mule_label_reason = (
-        "≥30% fraud transaction ratio" if fraud_ratio >= 0.30
-        else "≥2 fraud pattern transactions"
-        if pattern_count >= 2
-        else "network graph structural pattern"
-    )
+
+    # Explain WHY this account was labelled a mule during training
+    if fraud_ratio >= 0.30:
+        mule_label_reason = f"≥30% fraud transaction ratio ({fraud_ratio*100:.1f}%)"
+    elif pattern_count >= 2:
+        mule_label_reason = f"≥2 fraud pattern transactions ({pattern_count} detected)"
+    elif structural_mule:
+        mule_label_reason = (
+            f"Structural relay signature: {unique_senders} senders, "
+            f"{pass_thru:.2f}× pass-through, ${in_vol:,.0f} inflow"
+        )
+    else:
+        mule_label_reason = "GraphSAGE neighbourhood propagation (neighbours flagged)"
 
     sage_score = float(row.get("score") or 0)
     return {
@@ -417,15 +511,21 @@ async def get_account_graphsage(account_id: str):
         "features":           features,
         "triggered_count":    len(triggered_features),
         "feature_summary": {
-            "fraud_ratio_pct":   round(fraud_ratio * 100, 1),
-            "fraud_count":       fraud_count,
-            "pattern_count":     pattern_count,
-            "pass_through":      round(pass_thru, 2),
-            "unique_senders":    unique_senders,
-            "out_volume_usd":    round(out_vol, 0),
-            "in_volume_usd":     round(in_vol, 0),
-            "out_txn_count":     out_count,
-            "in_txn_count":      in_count,
+            "fraud_ratio_pct":      round(fraud_ratio * 100, 1),
+            "fraud_count":          fraud_count,
+            "pattern_count":        pattern_count,
+            "pass_through":         round(pass_thru, 2),
+            "unique_senders":       unique_senders,
+            "unique_receivers":     unique_receivers,
+            "sender_diversity":     round(sender_div, 2),
+            "funnel_concentration": round(funnel_conc, 2),
+            "net_retention_pct":    round(net_retention * 100, 1),
+            "out_volume_usd":       round(out_vol, 0),
+            "in_volume_usd":        round(in_vol, 0),
+            "out_txn_count":        out_count,
+            "in_txn_count":         in_count,
+            "triggered_patterns":   triggered_patterns,
+            "is_structural_mule":   structural_mule,
         },
         # Suspicious transactions
         "fraud_transactions":      all_txns,

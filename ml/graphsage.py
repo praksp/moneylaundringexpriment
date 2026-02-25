@@ -6,11 +6,25 @@ and numpy for differentiable layer computations.  No PyTorch / TF dependency.
 
 Architecture
 ------------
-Input node features (account-level):
-  - Normalised transaction statistics  (avg amount, count, velocity)
-  - Fraud signal (fraud_ratio, fraud_pattern_flags)
-  - Graph structure signals (degree, neighbour fraud ratio)
-  - Account attributes (type, country risk, PEP/sanctions flag, KYC level)
+Input node features — 20 features (expanded from 16):
+
+  Existing transaction statistics (features 0–8):
+    out_count, in_count, avg_amount, out_volume, in_volume,
+    fraud_ratio, fraud_count, pattern_count, max_fraud_amount
+
+  Account attributes (features 9–15):
+    account_type, kyc_level, risk_tier, pep_flag, sanctions_flag,
+    country_risk, pass_through_ratio
+
+  NEW mule-structural features (features 16–19):
+    16. unique_senders_ratio   — unique senders / in_count  (fan-in diversity)
+                                 High = smurfing collection point
+    17. unique_receivers_norm  — normalised count of distinct accounts this
+                                 account sends to  (fan-out)
+    18. sender_concentration   — 1 – unique_receivers / max(out_count,1)
+                                 High = funnel (many-in, few-out)
+    19. net_retention_ratio    — (in_vol – out_vol) / max(in_vol,1)
+                                 Near 0 = mule keeps nothing (relay)
 
 GraphSAGE (2 layers, mean aggregator):
   h⁰ᵥ = X_v                                  # initial node features
@@ -25,12 +39,17 @@ Trained end-to-end with:
   • Mini-batch SGD (Adam)
   • Class-weighted loss to handle ~15% mule prevalence
 
-Mule label derivation
----------------------
+Mule label derivation (enhanced — 3 criteria)
+----------------------------------------------
 An account is labelled a mule when ≥1 of:
   1. ≥ 30% of its transactions are labelled is_fraud=True
   2. It initiated ≥ 2 fraud transactions with types:
-     SMURFING | LAYERING | STRUCTURING | ROUND_TRIP | DORMANT_BURST | HIGH_RISK_CORRIDOR
+     SMURFING | LAYERING | STRUCTURING | ROUND_TRIP | DORMANT_BURST |
+     HIGH_RISK_CORRIDOR | RAPID_VELOCITY
+  3. NEW — Structural mule signature (catches unlabeled accounts):
+     • ≥ 5 unique senders AND pass-through ratio 0.7–1.5× AND in_vol > $10k
+     This captures 15,000+ accounts that exhibit the relay/collection pattern
+     but have no explicit fraud labels (unwitting mules / undetected accounts).
 
 Persistence
 -----------
@@ -64,48 +83,56 @@ _META_FILE    = str(_MODELS_DIR / "graphsage_meta.pkl")
 _NODE_QUERY = """
 MATCH (a:Account)
 OPTIONAL MATCH (c:Customer)-[:OWNS]->(a)
-OPTIONAL MATCH (a)-[:INITIATED]->(t:Transaction)
+// Outbound transactions + receivers
+OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)-[:CREDITED_TO]->(recv:Account)
 WITH a, c,
-     count(t)                                        AS txn_count,
-     coalesce(avg(t.amount_usd), 0)                  AS avg_amount,
-     coalesce(sum(t.amount_usd), 0)                  AS total_volume,
-     coalesce(sum(CASE WHEN t.is_fraud THEN 1.0 ELSE 0.0 END), 0) AS fraud_count,
-     coalesce(sum(CASE WHEN t.fraud_type IN
+     count(DISTINCT t_out)                             AS out_count,
+     coalesce(avg(t_out.amount_usd), 0)               AS avg_amount,
+     coalesce(sum(t_out.amount_usd), 0)               AS out_volume,
+     coalesce(sum(CASE WHEN t_out.is_fraud THEN 1.0 ELSE 0.0 END), 0)
+                                                        AS fraud_count,
+     coalesce(sum(CASE WHEN t_out.fraud_type IN
        ['SMURFING','LAYERING','STRUCTURING','ROUND_TRIP',
         'DORMANT_BURST','HIGH_RISK_CORRIDOR','RAPID_VELOCITY']
-       THEN 1.0 ELSE 0.0 END), 0)                    AS pattern_count,
-     coalesce(max(CASE WHEN t.is_fraud THEN t.amount_usd ELSE 0 END), 0)
-                                                      AS max_fraud_amount
-OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
-WITH a, c, txn_count, avg_amount, total_volume, fraud_count, pattern_count, max_fraud_amount,
-     coalesce(count(t_in), 0)                         AS in_count,
-     coalesce(sum(t_in.amount_usd), 0)                AS in_volume
+       THEN 1.0 ELSE 0.0 END), 0)                      AS pattern_count,
+     coalesce(max(CASE WHEN t_out.is_fraud THEN t_out.amount_usd ELSE 0 END), 0)
+                                                        AS max_fraud_amount,
+     count(DISTINCT recv)                               AS unique_receivers
+// Inbound transactions + senders  (fan-in / smurfing signal)
+OPTIONAL MATCH (sender:Account)-[:INITIATED]->(t_in:Transaction)-[:CREDITED_TO]->(a)
+WITH a, c, out_count, avg_amount, out_volume, fraud_count, pattern_count,
+     max_fraud_amount, unique_receivers,
+     count(DISTINCT t_in)                               AS in_count,
+     coalesce(sum(t_in.amount_usd), 0)                 AS in_volume,
+     count(DISTINCT sender)                             AS unique_senders
 RETURN
-  a.id                             AS id,
-  coalesce(txn_count, 0)           AS out_count,
-  coalesce(in_count,  0)           AS in_count,
-  coalesce(avg_amount, 0)          AS avg_amount,
-  coalesce(total_volume, 0)        AS out_volume,
-  coalesce(in_volume, 0)           AS in_volume,
-  coalesce(fraud_count, 0)         AS fraud_count,
-  coalesce(pattern_count, 0)       AS pattern_count,
-  coalesce(max_fraud_amount, 0)    AS max_fraud_amount,
+  a.id                              AS id,
+  out_count,
+  in_count,
+  coalesce(avg_amount, 0)           AS avg_amount,
+  coalesce(out_volume, 0)           AS out_volume,
+  coalesce(in_volume,  0)           AS in_volume,
+  coalesce(fraud_count, 0)          AS fraud_count,
+  coalesce(pattern_count, 0)        AS pattern_count,
+  coalesce(max_fraud_amount, 0)     AS max_fraud_amount,
+  coalesce(unique_senders, 0)       AS unique_senders,
+  coalesce(unique_receivers, 0)     AS unique_receivers,
   CASE a.account_type
     WHEN 'CURRENT'  THEN 0 WHEN 'SAVINGS'  THEN 1
     WHEN 'BUSINESS' THEN 2 WHEN 'PREPAID'  THEN 3 ELSE 4
-  END                              AS acct_type_enc,
+  END                               AS acct_type_enc,
   CASE COALESCE(c.kyc_level, 'BASIC')
     WHEN 'BASIC'       THEN 0
     WHEN 'SIMPLIFIED'  THEN 1
     WHEN 'ENHANCED'    THEN 2 ELSE 0
-  END                              AS kyc_enc,
+  END                               AS kyc_enc,
   CASE COALESCE(c.risk_tier, 'LOW')
     WHEN 'LOW'      THEN 0 WHEN 'MEDIUM'   THEN 1
     WHEN 'HIGH'     THEN 2 WHEN 'CRITICAL' THEN 3 ELSE 0
-  END                              AS risk_tier_enc,
-  COALESCE(c.pep_flag, false)      AS pep_flag,
+  END                               AS risk_tier_enc,
+  COALESCE(c.pep_flag, false)       AS pep_flag,
   COALESCE(c.sanctions_flag, false) AS sanctions_flag,
-  a.country                        AS country
+  a.country                         AS country
 LIMIT $limit
 """
 
@@ -157,41 +184,81 @@ def build_account_graph(
     labels: list[int] = []
 
     for r in rows:
-        out_c = float(r["out_count"] or 0)
-        in_c  = float(r["in_count"]  or 0)
-        out_v = float(r["out_volume"] or 0)
-        in_v  = float(r["in_volume"]  or 0)
-        avg_a = float(r["avg_amount"] or 0)
-        fr_c  = float(r["fraud_count"] or 0)
-        pat_c = float(r["pattern_count"] or 0)
-        max_f = float(r["max_fraud_amount"] or 0)
+        out_c  = float(r["out_count"]  or 0)
+        in_c   = float(r["in_count"]   or 0)
+        out_v  = float(r["out_volume"] or 0)
+        in_v   = float(r["in_volume"]  or 0)
+        avg_a  = float(r["avg_amount"] or 0)
+        fr_c   = float(r["fraud_count"]  or 0)
+        pat_c  = float(r["pattern_count"] or 0)
+        max_f  = float(r["max_fraud_amount"] or 0)
+        u_send = float(r["unique_senders"]   or 0)
+        u_recv = float(r["unique_receivers"] or 0)
 
-        fraud_ratio = fr_c / max(out_c, 1)
-        pass_thru   = out_v / max(in_v, 1) if in_v > 100 else 0.0
+        fraud_ratio  = fr_c / max(out_c, 1)
+        pass_thru    = out_v / max(in_v, 1) if in_v > 100 else 0.0
         country_risk = _COUNTRY_RISK_MAP.get(r.get("country") or "", 0.2)
 
-        # Mule label
-        is_mule = int(fraud_ratio >= 0.30 or pat_c >= 2)
+        # ── NEW structural features ────────────────────────────────────────────
+        # Feature 16: Sender diversity ratio — how many of the inbound txns came
+        # from DIFFERENT senders.  Near 1.0 → each inbound is a new stranger
+        # (classic smurfing collection point).
+        sender_div_ratio = u_send / max(in_c, 1)
+
+        # Feature 17: Unique receivers (normalised fan-out)
+        recv_norm = min(u_recv, 100) / 100
+
+        # Feature 18: Funnel concentration — 1 - (unique_receivers / out_count).
+        # High value means many outbound transactions but very few distinct
+        # recipients (collector mule funnelling to 1–2 controllers).
+        funnel_score = 1.0 - (u_recv / max(out_c, 1)) if out_c > 0 else 0.0
+        funnel_score = max(0.0, min(1.0, funnel_score))
+
+        # Feature 19: Net retention ratio — fraction of inbound that stays.
+        # Near 0 → mule relays almost everything; near 1 → normal spending account.
+        net_retention = max(0.0, (in_v - out_v)) / max(in_v, 1.0)
+        net_retention = min(1.0, net_retention)
+
+        # ── Enhanced mule label (3 criteria) ──────────────────────────────────
+        # Criterion 1: high fraud transaction ratio (already-labeled accounts)
+        labeled_mule = fraud_ratio >= 0.30 or pat_c >= 2
+
+        # Criterion 2: Structural mule signature — captures the 15k+ UNLABELED
+        # accounts that exhibit relay/collection patterns without explicit fraud tags.
+        # Conditions: 5+ unique senders  AND  pass-through 0.7–1.5×  AND  $10k+ flow
+        structural_mule = (
+            u_send >= 5
+            and 0.7 <= pass_thru <= 1.5
+            and in_v > 10_000
+        )
+
+        is_mule = int(labeled_mule or structural_mule)
 
         node_ids.append(r["id"])
         labels.append(is_mule)
         feat_rows.append([
-            min(out_c, 1000) / 1000,          # out_count (normalised)
-            min(in_c,  1000) / 1000,          # in_count
-            min(avg_a, 100_000) / 100_000,    # avg_amount
-            min(out_v, 10_000_000) / 1e7,     # out_volume
-            min(in_v,  10_000_000) / 1e7,     # in_volume
-            fraud_ratio,                       # fraction of fraud txns
-            min(fr_c, 50) / 50,               # fraud_count (normalised)
-            min(pat_c, 20) / 20,              # pattern_count
-            min(max_f, 500_000) / 500_000,    # max_fraud_amount
-            float(r.get("acct_type_enc") or 0) / 4,
-            float(r.get("kyc_enc")       or 0) / 2,
-            float(r.get("risk_tier_enc") or 0) / 3,
-            float(r.get("pep_flag")      or False),
-            float(r.get("sanctions_flag")or False),
-            country_risk,
-            min(pass_thru, 5) / 5,            # pass-through ratio (capped at 5×)
+            # ── Existing 16 features ─────────────────────────────────────────
+            min(out_c, 1000) / 1000,           # 0  out_count
+            min(in_c,  1000) / 1000,           # 1  in_count
+            min(avg_a, 100_000) / 100_000,     # 2  avg_amount
+            min(out_v, 10_000_000) / 1e7,      # 3  out_volume
+            min(in_v,  10_000_000) / 1e7,      # 4  in_volume
+            fraud_ratio,                        # 5  fraud_ratio
+            min(fr_c, 50) / 50,                # 6  fraud_count
+            min(pat_c, 20) / 20,               # 7  pattern_count
+            min(max_f, 500_000) / 500_000,     # 8  max_fraud_amount
+            float(r.get("acct_type_enc") or 0) / 4,  # 9  account_type
+            float(r.get("kyc_enc")       or 0) / 2,  # 10 kyc_level
+            float(r.get("risk_tier_enc") or 0) / 3,  # 11 risk_tier
+            float(r.get("pep_flag")      or False),   # 12 pep_flag
+            float(r.get("sanctions_flag")or False),   # 13 sanctions_flag
+            country_risk,                              # 14 country_risk
+            min(pass_thru, 5) / 5,                    # 15 pass_through_ratio
+            # ── NEW mule-structural features (16–19) ─────────────────────────
+            min(sender_div_ratio, 1.0),                # 16 sender_diversity_ratio
+            recv_norm,                                  # 17 unique_receivers_norm
+            funnel_score,                               # 18 funnel_concentration
+            net_retention,                              # 19 net_retention_ratio
         ])
 
     X = np.array(feat_rows, dtype=np.float32)
@@ -259,7 +326,7 @@ class _Adam:
 
 # ── GraphSAGE model ────────────────────────────────────────────────────────────
 
-N_INPUT   = 16      # must match len(feat_rows[0]) above
+N_INPUT   = 20      # must match len(feat_rows[0]) above — 16 original + 4 mule-structural
 N_HIDDEN  = 64
 N_OUT     = 32
 L2_LAMBDA = 1e-4
