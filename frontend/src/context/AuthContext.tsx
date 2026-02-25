@@ -26,14 +26,29 @@ const TOKEN_KEY = 'aml_token'
 const USER_KEY  = 'aml_user'
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY))
+  const [token, setToken] = useState<string | null>(() => {
+    const t = localStorage.getItem(TOKEN_KEY)
+    // Synchronously seed the axios default header so the very first request
+    // is authenticated — before any useEffect has a chance to run.
+    if (t) api.defaults.headers.common['Authorization'] = `Bearer ${t}`
+    return t
+  })
   const [user, setUser]   = useState<AuthUser | null>(() => {
     const raw = localStorage.getItem(USER_KEY)
     return raw ? (JSON.parse(raw) as AuthUser) : null
   })
   const [isLoading, setIsLoading] = useState(false)
 
-  // Inject token into every axios request
+  // Keep axios default header in sync whenever the token changes
+  useEffect(() => {
+    if (token) {
+      api.defaults.headers.common['Authorization'] = `Bearer ${token}`
+    } else {
+      delete api.defaults.headers.common['Authorization']
+    }
+  }, [token])
+
+  // Inject token into every axios request (belt-and-suspenders)
   useEffect(() => {
     const interceptor = api.interceptors.request.use(config => {
       if (token) config.headers.Authorization = `Bearer ${token}`
@@ -62,6 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         { username, password },
       )
       const { access_token, user: u } = res.data
+      api.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
       setToken(access_token)
       setUser(u)
       localStorage.setItem(TOKEN_KEY, access_token)
@@ -72,6 +88,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   const logout = () => {
+    delete api.defaults.headers.common['Authorization']
     setToken(null)
     setUser(null)
     localStorage.removeItem(TOKEN_KEY)

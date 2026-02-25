@@ -4,20 +4,53 @@ An Anti-Money Laundering (AML) detection system built on a **Neo4j graph databas
 
 ## Screenshots
 
+### Login
+![Login](screenshots/login.png)
+
 ### Dashboard
 ![Dashboard](screenshots/dashboard.png)
+
+### Dashboard — World Transaction Heatmap
+![Dashboard Map](screenshots/dashboard-map.png)
+
+### Global Overview
+![Global Overview](screenshots/global-overview.png)
 
 ### Submit Transaction
 ![Submit Transaction](screenshots/submit-transaction.png)
 
-### Customer Profile with World Map
+### Customer Profile List
 ![Customer Profile](screenshots/customer-profile.png)
+
+### Customer Detail with Transaction History
+![Customer Detail](screenshots/customer-detail.png)
 
 ### Transaction Detail & Risk Breakdown
 ![Transaction Detail](screenshots/transaction-detail.png)
 
 ### Model Monitor & Drift Detection
 ![Model Monitor](screenshots/model-monitor.png)
+
+### Model Monitor — Charts
+![Model Monitor Charts](screenshots/model-monitor-charts.png)
+
+### Feature Store — High-Risk Account Analysis
+![Feature Store](screenshots/feature-store.png)
+
+### KNN Anomaly Detection
+![KNN Anomaly](screenshots/knn-anomaly.png)
+
+### GraphSAGE Mule Account Detection
+![GraphSAGE Detection](screenshots/graphsage-detection.png)
+
+### GraphSAGE — Account Detail (Mule Pattern Badges)
+![GraphSAGE Drawer](screenshots/graphsage-drawer.png)
+
+### GraphSAGE — Suspicious Transactions
+![GraphSAGE Drawer Transactions](screenshots/graphsage-drawer-txns.png)
+
+### GraphSAGE — How It Works (Mule Pattern Glossary)
+![GraphSAGE Patterns](screenshots/graphsage-patterns.png)
 
 ## Architecture
 
