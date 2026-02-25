@@ -191,11 +191,20 @@ function AccountDetailDrawer({ accountId, onClose }: { accountId: string; onClos
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
+const SAMPLE_OPTIONS = [
+  { label: '1 000',  value: 1_000 },
+  { label: '5 000',  value: 5_000 },
+  { label: '10 000', value: 10_000 },
+  { label: '25 000', value: 25_000 },
+]
+
 export default function AnomalyDetection() {
   const qc = useQueryClient()
   const [page, setPage]         = useState(1)
   const [search, setSearch]     = useState('')
   const [selectedAcct, setSelectedAcct] = useState<string | null>(null)
+  const [maxNormal, setMaxNormal]   = useState(5_000)
+  const [maxAccounts, setMaxAccounts] = useState(5_000)
   const PAGE_SIZE = 50
 
   const { data: summary } = useQuery({
@@ -211,22 +220,22 @@ export default function AnomalyDetection() {
   })
 
   const trainMutation = useMutation({
-    mutationFn: trainAnomalyDetector,
+    mutationFn: () => trainAnomalyDetector(maxNormal, maxAccounts),
     onSuccess: () => {
       setTimeout(() => {
         qc.invalidateQueries({ queryKey: ['anomaly-summary'] })
         qc.invalidateQueries({ queryKey: ['anomaly-suspects'] })
-      }, 2000)
+      }, 4000)
     },
   })
 
   const scanMutation = useMutation({
-    mutationFn: () => scanAccounts(true),
+    mutationFn: () => scanAccounts(true, maxAccounts),
     onSuccess: () => {
       setTimeout(() => {
         qc.invalidateQueries({ queryKey: ['anomaly-summary'] })
         qc.invalidateQueries({ queryKey: ['anomaly-suspects'] })
-      }, 3000)
+      }, 5000)
     },
   })
 
@@ -242,7 +251,7 @@ export default function AnomalyDetection() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
             <ShieldAlert className="w-7 h-7 text-red-500" />
@@ -252,29 +261,73 @@ export default function AnomalyDetection() {
             KNN-powered detection of money-mule accounts — trained on normal transaction patterns
           </p>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => trainMutation.mutate()}
-            disabled={trainMutation.isPending}
-            className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 text-white text-sm font-medium
-              rounded-lg hover:bg-indigo-700 disabled:opacity-60 transition-colors"
-          >
-            {trainMutation.isPending
-              ? <RefreshCw className="w-4 h-4 animate-spin" />
-              : <Zap className="w-4 h-4" />}
-            {trainMutation.isPending ? 'Training…' : 'Train Detector'}
-          </button>
-          <button
-            onClick={() => scanMutation.mutate()}
-            disabled={scanMutation.isPending || !summary?.detector_trained}
-            className="flex items-center gap-1.5 px-4 py-2 bg-orange-600 text-white text-sm font-medium
-              rounded-lg hover:bg-orange-700 disabled:opacity-60 transition-colors"
-          >
-            {scanMutation.isPending
-              ? <RefreshCw className="w-4 h-4 animate-spin" />
-              : <Activity className="w-4 h-4" />}
-            {scanMutation.isPending ? 'Scanning…' : 'Scan All Accounts'}
-          </button>
+
+        {/* Controls panel */}
+        <div className="flex flex-col gap-2 min-w-[340px]">
+          {/* Sample size selectors */}
+          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-xs">
+            <Info className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+            <label className="text-gray-500 whitespace-nowrap">Train on</label>
+            <select
+              value={maxNormal}
+              onChange={e => setMaxNormal(Number(e.target.value))}
+              className="border border-gray-300 rounded px-1.5 py-0.5 bg-white text-gray-700"
+            >
+              {SAMPLE_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label} txns</option>
+              ))}
+            </select>
+            <label className="text-gray-500 whitespace-nowrap">· Scan</label>
+            <select
+              value={maxAccounts}
+              onChange={e => setMaxAccounts(Number(e.target.value))}
+              className="border border-gray-300 rounded px-1.5 py-0.5 bg-white text-gray-700"
+            >
+              {SAMPLE_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label} accts</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Action buttons */}
+          <div className="flex gap-2">
+            <button
+              onClick={() => trainMutation.mutate()}
+              disabled={trainMutation.isPending}
+              className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 bg-indigo-600 text-white text-sm font-medium
+                rounded-lg hover:bg-indigo-700 disabled:opacity-60 transition-colors"
+            >
+              {trainMutation.isPending
+                ? <RefreshCw className="w-4 h-4 animate-spin" />
+                : <Zap className="w-4 h-4" />}
+              {trainMutation.isPending ? 'Training…' : 'Train Detector'}
+            </button>
+            <button
+              onClick={() => scanMutation.mutate()}
+              disabled={scanMutation.isPending || !summary?.detector_trained}
+              className="flex-1 flex items-center justify-center gap-1.5 px-4 py-2 bg-orange-600 text-white text-sm font-medium
+                rounded-lg hover:bg-orange-700 disabled:opacity-60 transition-colors"
+            >
+              {scanMutation.isPending
+                ? <RefreshCw className="w-4 h-4 animate-spin" />
+                : <Activity className="w-4 h-4" />}
+              {scanMutation.isPending ? 'Scanning…' : 'Scan Accounts'}
+            </button>
+          </div>
+
+          {/* In-progress banner */}
+          {(trainMutation.isPending || scanMutation.isPending) && (
+            <p className="text-xs text-indigo-600 text-center animate-pulse">
+              {trainMutation.isPending
+                ? `Training on ${maxNormal.toLocaleString()} transactions + scanning ${maxAccounts.toLocaleString()} accounts…`
+                : `Scanning ${maxAccounts.toLocaleString()} accounts for anomalies…`}
+            </p>
+          )}
+          {(trainMutation.isSuccess || scanMutation.isSuccess) && (
+            <p className="text-xs text-green-600 text-center">
+              ✓ Complete — results refreshing…
+            </p>
+          )}
         </div>
       </div>
 

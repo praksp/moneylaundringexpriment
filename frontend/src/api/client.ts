@@ -421,11 +421,13 @@ export const getAccountAnomaly = (accountId: string) =>
 export const getCustomerAnomaly = (customerId: string) =>
   api.get(`/anomaly/customers/${customerId}`).then(r => r.data)
 
-export const trainAnomalyDetector = () =>
-  api.post('/anomaly/train').then(r => r.data)
+export const trainAnomalyDetector = (maxNormal = 5000, maxAccounts = 5000) =>
+  api.post('/anomaly/train', null, {
+    params: { max_normal: maxNormal, max_accounts: maxAccounts },
+  }).then(r => r.data)
 
-export const scanAccounts = (force = false) =>
-  api.post('/anomaly/scan', null, { params: { force } }).then(r => r.data)
+export const scanAccounts = (force = false, maxAccounts = 5000) =>
+  api.post('/anomaly/scan', null, { params: { force, max_accounts: maxAccounts } }).then(r => r.data)
 
 // ── GraphSAGE Mule Detection ─────────────────────────────────────────────────
 

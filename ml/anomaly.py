@@ -5,35 +5,33 @@ Repurposes FAISS KNN for unsupervised anomaly detection on mule accounts.
 
 How it works
 ------------
-1.  During training, the detector builds a FAISS IndexFlatL2 index on
-    NORMAL (non-fraud) transaction feature vectors ONLY.
+1.  Training: load account-level feature vectors (8 dims) for a sample of
+    accounts via a single batch Cypher query, then build a FAISS index on
+    the LOW-RISK subset (pass_through_ratio < 0.6).
 
-2.  At inference, it computes the average L2 distance of an account's
-    transactions to their K nearest normal neighbours.
-    • Short distance → account behaves like normal customers → low anomaly
-    • Large distance → account's behaviour is unusual compared to normal → high anomaly
+2.  Scoring: for a given account, compute account-level feature vector in
+    ONE Neo4j query and compare it to the FAISS index.
+    • Short L2 distance → account behaves like normal customers → low anomaly
+    • Large distance → structurally unusual → high anomaly
 
-3.  Mule-account composite score (0–100) combines:
-    a. KNN distance anomaly (structural deviation from normal behaviour)
-    b. Rule-based mule indicators derived from graph topology:
+3.  Composite score (0–100) combines KNN distance anomaly + rule-based
+    mule indicators:
        - Pass-through ratio (inbound ≈ outbound volume)
-       - Rapid disbursement (low hold time)
+       - Rapid disbursement (high out_30 with ptr > 0.7)
        - High unique sender count (aggregating from many sources)
        - Structuring patterns (sub-10k transactions)
-       - Geographic spread (cross-border)
 
 4.  Results are stored in Neo4j as Account.anomaly_score and
-    Account.mule_suspect properties for fast API queries.
+    Account.mule_suspect for fast API queries.
 
 Persistence
 -----------
-  models_saved/anomaly_index.faiss  — FAISS index (normal transaction vectors)
+  models_saved/anomaly_index.faiss  — FAISS index (account feature vectors)
   models_saved/anomaly_meta.pkl     — scaler + threshold + stats
 """
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -49,167 +47,192 @@ except ImportError:
     _USE_FAISS = False
 
 from db.client import neo4j_session
-from risk.features import extract_features, FeatureVector
 
-# ── Lightweight normal-transaction loader ─────────────────────────────────────
+# ── Batch account-stats loader ────────────────────────────────────────────────
 
-_NORMAL_TXN_QUERY = """
-MATCH (sender:Account)-[:INITIATED]->(t:Transaction {is_fraud: false})
-OPTIONAL MATCH (t)-[:CREDITED_TO]->(receiver:Account)
-OPTIONAL MATCH (sender)<-[:OWNS]-(sc:Customer)
-OPTIONAL MATCH (receiver)<-[:OWNS]-(rc:Customer)
-OPTIONAL MATCH (t)-[:ORIGINATED_FROM]->(device:Device)
-OPTIONAL MATCH (t)-[:SOURCED_FROM]->(ip:IPAddress)
-OPTIONAL MATCH (t)-[:SENT_TO_EXTERNAL]->(ben:BeneficiaryAccount)
-RETURN t, sender, receiver, sc AS sender_customer, rc AS receiver_customer,
-       device, ip, null AS merchant, ben AS beneficiary
+_BATCH_STATS_QUERY = """
+MATCH (a:Account)
+OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
+OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+WITH a,
+     coalesce(sum(t_out.amount), 0) AS out_volume,
+     coalesce(sum(t_in.amount),  0) AS in_volume,
+     coalesce(avg(t_out.amount), 0) AS avg_out,
+     coalesce(avg(t_in.amount),  0) AS avg_in
+OPTIONAL MATCH (sender_acct:Account)-[:INITIATED]->(txn_in2:Transaction)-[:CREDITED_TO]->(a)
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     count(DISTINCT sender_acct) AS unique_senders
+OPTIONAL MATCH (a)-[:INITIATED]->(struct_tx:Transaction)
+  WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, count(struct_tx) AS structuring
+OPTIONAL MATCH (a)-[:INITIATED]->(t_30:Transaction)
+  WHERE t_30.timestamp >= $since_30d
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, structuring,
+     count(DISTINCT t_30) AS out_30d
+RETURN
+  a.id                       AS id,
+  out_volume, in_volume, avg_out, avg_in,
+  unique_senders, structuring, out_30d,
+  a.average_monthly_volume   AS avg_monthly_vol
 ORDER BY rand()
+SKIP $skip
 LIMIT $limit
 """
 
 
-def _load_normal_transactions(limit: int = 100_000) -> np.ndarray:
+def _load_account_feature_matrix(
+    limit: int = 5_000,
+) -> tuple[np.ndarray, list[str]]:
     """
-    Load up to `limit` normal transaction feature vectors directly,
-    without building a large Python list-of-lists first.
-    Uses random ORDER BY rand() for a representative sample.
-    Returns float32 ndarray of shape (n, n_features).
+    Load account-level statistics for up to `limit` accounts in one query.
+    Returns (X float32 (n, 8), account_ids).
     """
+    since_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
     with neo4j_session() as s:
-        records = list(s.run(_NORMAL_TXN_QUERY, limit=limit))
+        records = list(s.run(_BATCH_STATS_QUERY, since_30d=since_30d, skip=0, limit=limit))
 
     rows: list[np.ndarray] = []
+    ids: list[str] = []
     for rec in records:
         try:
-            txn    = dict(rec["t"])
-            sender = dict(rec["sender"] or {})
-            graph_data = {
-                "sender":           sender,
-                "receiver":         dict(rec["receiver"] or {}) if rec["receiver"] else {},
-                "sender_customer":  dict(rec["sender_customer"] or {}) if rec["sender_customer"] else {},
-                "receiver_customer":dict(rec["receiver_customer"] or {}) if rec["receiver_customer"] else {},
-                "device":           dict(rec["device"] or {}) if rec["device"] else {},
-                "ip":               dict(rec["ip"] or {}) if rec["ip"] else {},
-                "merchant":         {},
-                "beneficiary":      dict(rec["beneficiary"] or {}) if rec["beneficiary"] else {},
-                "txn_count_1h": 0, "txn_count_24h": 0, "txn_count_7d": 0,
-                "total_amount_24h": 0.0, "total_amount_7d": 0.0,
-                "structuring_count_24h": 0, "round_trip_count": 0,
-                "shared_device_user_count": 1, "network_hop_count": 1,
-            }
-            fv = extract_features(txn, graph_data)
-            rows.append(np.array(fv.to_ml_array(), dtype=np.float32))
+            fv = _stats_to_feature_vector(dict(rec))
+            rows.append(fv)
+            ids.append(rec["id"])
         except Exception:
             continue
 
     if not rows:
-        return np.empty((0, len(FeatureVector.feature_names())), dtype=np.float32)
-    return np.vstack(rows)
+        return np.empty((0, 8), dtype=np.float32), []
+    return np.vstack(rows).astype(np.float32), ids
 
 _MODELS_DIR  = Path("models_saved")
 _INDEX_FILE  = str(_MODELS_DIR / "anomaly_index.faiss")
 _META_FILE   = str(_MODELS_DIR / "anomaly_meta.pkl")
 
-_K           = 11       # neighbours for distance computation
-_EVAL_CAP    = 1_000    # subsample for calibration stats (speed)
+_K           = 7        # neighbours for distance computation
+_EVAL_CAP    = 500      # subsample for calibration stats (speed)
 
 
-# ── Account-level feature extraction from Neo4j ────────────────────────────────
+# ── Single-account stats query (for live scoring) ──────────────────────────────
 
-ACCOUNT_STATS_QUERY = """
+SINGLE_ACCOUNT_QUERY = """
 MATCH (a:Account {id: $account_id})
 OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
 OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
 WITH a,
-     count(DISTINCT t_out) AS out_count,
-     count(DISTINCT t_in)  AS in_count,
      coalesce(sum(t_out.amount), 0) AS out_volume,
      coalesce(sum(t_in.amount),  0) AS in_volume,
      coalesce(avg(t_out.amount), 0) AS avg_out,
      coalesce(avg(t_in.amount),  0) AS avg_in
-OPTIONAL MATCH (a)-[:INITIATED]->(tx_out:Transaction)
-WHERE tx_out.timestamp >= $since_30d
-OPTIONAL MATCH (tx_in:Transaction)-[:CREDITED_TO]->(a)
-WHERE tx_in.timestamp >= $since_30d
-WITH a, out_count, in_count, out_volume, in_volume, avg_out, avg_in,
-     count(DISTINCT tx_out) AS out_30d,
-     count(DISTINCT tx_in)  AS in_30d,
-     coalesce(sum(tx_out.amount), 0) AS out_vol_30d,
-     coalesce(sum(tx_in.amount),  0) AS in_vol_30d
-OPTIONAL MATCH (sender_acct:Account)-[:INITIATED]->(txn_in:Transaction)-[:CREDITED_TO]->(a)
-WHERE txn_in.timestamp >= $since_30d
-WITH a, out_count, in_count, out_volume, in_volume, avg_out, avg_in,
-     out_30d, in_30d, out_vol_30d, in_vol_30d,
-     count(DISTINCT sender_acct) AS unique_senders_30d
+OPTIONAL MATCH (sender_acct:Account)-[:INITIATED]->(txn_in2:Transaction)-[:CREDITED_TO]->(a)
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     count(DISTINCT sender_acct) AS unique_senders
 OPTIONAL MATCH (a)-[:INITIATED]->(struct_tx:Transaction)
-WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
-     AND struct_tx.timestamp >= $since_30d
-WITH a, out_count, in_count, out_volume, in_volume, avg_out, avg_in,
-     out_30d, in_30d, out_vol_30d, in_vol_30d,
-     unique_senders_30d, count(struct_tx) AS structuring_30d
+  WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, count(struct_tx) AS structuring
+OPTIONAL MATCH (a)-[:INITIATED]->(t_30:Transaction)
+  WHERE t_30.timestamp >= $since_30d
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, structuring,
+     count(DISTINCT t_30) AS out_30d
 RETURN
-  out_count, in_count, out_volume, in_volume, avg_out, avg_in,
-  out_30d, in_30d, out_vol_30d, in_vol_30d,
-  unique_senders_30d, structuring_30d,
-  a.country AS country, a.account_type AS account_type,
-  a.typical_transaction_size AS typical_txn_size,
+  a.id                       AS id,
+  out_volume, in_volume, avg_out, avg_in,
+  unique_senders, structuring, out_30d,
   a.average_monthly_volume   AS avg_monthly_vol
 """
 
-TXN_FEATURES_QUERY = """
-MATCH (a:Account {id: $account_id})-[:INITIATED]->(t:Transaction)
-OPTIONAL MATCH (t)-[:CREDITED_TO]->(recv:Account)
-OPTIONAL MATCH (a)<-[:OWNS]-(sc:Customer)
-OPTIONAL MATCH (recv)<-[:OWNS]-(rc:Customer)
-OPTIONAL MATCH (t)-[:ORIGINATED_FROM]->(d:Device)
-OPTIONAL MATCH (t)-[:SOURCED_FROM]->(ip:IPAddress)
-OPTIONAL MATCH (t)-[:SENT_TO_EXTERNAL]->(ben:BeneficiaryAccount)
-RETURN t, a AS sender, recv AS receiver,
-       sc AS sender_customer, rc AS receiver_customer,
-       d AS device, ip, null AS merchant, ben AS beneficiary
-LIMIT 200
-"""
-
-BATCH_ACCOUNTS_QUERY = """
+# Batch query for scanning accounts (with/without existing scores)
+_BATCH_SCAN_QUERY = """
 MATCH (a:Account)
-WHERE NOT EXISTS(a.anomaly_score)   // skip already scored unless forced
-RETURN a.id AS id
+WHERE NOT EXISTS(a.anomaly_score)
+WITH a
+MATCH (a)-[:INITIATED]->(t_out:Transaction)
+OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+WITH a,
+     coalesce(sum(t_out.amount), 0) AS out_volume,
+     coalesce(sum(t_in.amount),  0) AS in_volume,
+     coalesce(avg(t_out.amount), 0) AS avg_out,
+     coalesce(avg(t_in.amount),  0) AS avg_in
+OPTIONAL MATCH (sender_acct:Account)-[:INITIATED]->(txn_in2:Transaction)-[:CREDITED_TO]->(a)
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     count(DISTINCT sender_acct) AS unique_senders
+OPTIONAL MATCH (a)-[:INITIATED]->(struct_tx:Transaction)
+  WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, count(struct_tx) AS structuring
+OPTIONAL MATCH (a)-[:INITIATED]->(t_30:Transaction)
+  WHERE t_30.timestamp >= $since_30d
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, structuring,
+     count(DISTINCT t_30) AS out_30d
+RETURN
+  a.id AS id,
+  out_volume, in_volume, avg_out, avg_in,
+  unique_senders, structuring, out_30d,
+  a.average_monthly_volume AS avg_monthly_vol
 SKIP $skip LIMIT $limit
 """
 
-BATCH_ALL_ACCOUNTS_QUERY = """
-MATCH (a:Account) RETURN a.id AS id SKIP $skip LIMIT $limit
+_BATCH_SCAN_FORCE_QUERY = """
+MATCH (a:Account)
+OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
+OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+WITH a,
+     coalesce(sum(t_out.amount), 0) AS out_volume,
+     coalesce(sum(t_in.amount),  0) AS in_volume,
+     coalesce(avg(t_out.amount), 0) AS avg_out,
+     coalesce(avg(t_in.amount),  0) AS avg_in
+OPTIONAL MATCH (sender_acct:Account)-[:INITIATED]->(txn_in2:Transaction)-[:CREDITED_TO]->(a)
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     count(DISTINCT sender_acct) AS unique_senders
+OPTIONAL MATCH (a)-[:INITIATED]->(struct_tx:Transaction)
+  WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, count(struct_tx) AS structuring
+OPTIONAL MATCH (a)-[:INITIATED]->(t_30:Transaction)
+  WHERE t_30.timestamp >= $since_30d
+WITH a, out_volume, in_volume, avg_out, avg_in,
+     unique_senders, structuring,
+     count(DISTINCT t_30) AS out_30d
+RETURN
+  a.id AS id,
+  out_volume, in_volume, avg_out, avg_in,
+  unique_senders, structuring, out_30d,
+  a.average_monthly_volume AS avg_monthly_vol
+SKIP $skip LIMIT $limit
 """
 
 
-def _account_feature_vector(stats: dict) -> np.ndarray:
+def _stats_to_feature_vector(stats: dict) -> np.ndarray:
     """
-    Build a numeric feature vector from account-level statistics.
-    Returns shape (8,) float32 array.
+    Build an 8-dim feature vector from account-level statistics row.
+    All fields come from the batch/single Cypher queries above.
     """
     out_vol = float(stats.get("out_volume") or 0)
     in_vol  = float(stats.get("in_volume")  or 1)
-    out_30  = float(stats.get("out_vol_30d") or 0)
-    in_30   = float(stats.get("in_vol_30d")  or 1)
 
     pass_through_ratio = min(out_vol / max(in_vol, 1), 5.0)
-    unique_senders     = min(float(stats.get("unique_senders_30d") or 0), 100)
-    structuring        = min(float(stats.get("structuring_30d") or 0), 50)
-    out_count_30       = min(float(stats.get("out_30d") or 0), 500)
-    in_count_30        = min(float(stats.get("in_30d")  or 0), 500)
+    unique_senders     = min(float(stats.get("unique_senders") or 0), 100)
+    structuring        = min(float(stats.get("structuring") or 0), 50)
+    out_30d            = min(float(stats.get("out_30d") or 0), 500)
     avg_out_amt        = min(float(stats.get("avg_out") or 0), 100_000)
     avg_in_amt         = min(float(stats.get("avg_in")  or 0), 100_000)
     monthly_vol        = min(float(stats.get("avg_monthly_vol") or 0), 1_000_000)
+    vol_ratio          = min(max(out_vol, in_vol) / max(min(out_vol, in_vol), 1), 50)
 
     return np.array([
         pass_through_ratio,
         unique_senders,
         structuring,
-        out_count_30,
-        in_count_30,
+        out_30d,
         avg_out_amt,
         avg_in_amt,
         monthly_vol,
+        vol_ratio,
     ], dtype=np.float32)
 
 
@@ -227,27 +250,42 @@ class MuleAccountDetector:
 
     # ── Training ───────────────────────────────────────────────────────────────
 
-    # Number of normal-transaction vectors to load and index.
-    # Kept small to avoid memory pressure — 80k is more than sufficient to
-    # represent the distribution of legitimate behaviour.
-    _MAX_INDEX = 80_000
+    # Default number of account vectors to sample for the index.
+    _MAX_INDEX = 5_000
 
-    def fit(self, X: np.ndarray | None = None, y: np.ndarray | None = None) -> dict:
+    def fit(
+        self,
+        X: np.ndarray | None = None,
+        y: np.ndarray | None = None,
+        max_normal: int | None = None,
+    ) -> dict:
         """
-        Build the anomaly index.
+        Build the anomaly index on a sample of account feature vectors.
 
-        When called from train_and_save_all() X and y are available (already loaded).
-        To avoid duplicating the 1GB list-of-lists allocation, we instead load a
-        fresh small sample of normal transactions directly from Neo4j.
-        X and y are accepted but ignored — the dedicated loader is always used.
+        max_normal — how many accounts to sample (default: _MAX_INDEX = 5 000).
+        We load account-level stats (one batch Cypher query) which is much
+        faster than loading per-transaction feature vectors.
+        X and y are accepted for API compatibility but ignored.
         """
-        print(f"  Loading up to {self._MAX_INDEX:,} normal transactions from Neo4j…")
-        X_normal = _load_normal_transactions(limit=self._MAX_INDEX)
-        n_normal = len(X_normal)
-        if n_normal == 0:
-            print("  ⚠ No normal transactions found — detector not trained.")
+        limit = max_normal if max_normal and max_normal > 0 else self._MAX_INDEX
+        print(f"  Loading account stats for up to {limit:,} accounts from Neo4j…")
+        X_all, ids = _load_account_feature_matrix(limit=limit)
+        n_total = len(X_all)
+        if n_total == 0:
+            print("  ⚠ No account data found — detector not trained.")
             return {"n_normal_vectors": 0, "p95_dist": 0.0}
-        print(f"  Building anomaly index on {n_normal:,} normal transaction vectors…")
+
+        # Use accounts with low pass-through ratio as the "normal" reference
+        ptr_col = X_all[:, 0]  # pass_through_ratio is feature index 0
+        normal_mask = ptr_col < 0.6
+        X_normal = X_all[normal_mask]
+        if len(X_normal) < 10:
+            # fallback: use all accounts
+            X_normal = X_all
+
+        n_normal = len(X_normal)
+        print(f"  Building anomaly index on {n_normal:,} normal account vectors "
+              f"(out of {n_total:,} total)…")
 
         self._scaler = StandardScaler()
         X_s = self._scaler.fit_transform(X_normal).astype(np.float32)
@@ -257,18 +295,18 @@ class MuleAccountDetector:
             self._index = faiss.IndexFlatL2(n_features)
             self._index.add(np.ascontiguousarray(X_s))
         else:
-            # Fallback: store raw scaled vectors for brute-force numpy search
             self._index = X_s
 
         # Calibrate p95 distance on a subsample of normal vectors
         cap = min(_EVAL_CAP, n_normal)
         rng = np.random.default_rng(42)
         sample = X_s[rng.choice(n_normal, cap, replace=False)]
-        dists  = self._query_distances(sample)         # (cap,) mean distances
+        dists  = self._query_distances(sample)
         self._p95_dist = float(np.percentile(dists, 95)) or 1.0
 
         self.is_trained = True
         return {
+            "n_accounts_sampled": n_total,
             "n_normal_vectors": n_normal,
             "p95_dist": round(self._p95_dist, 4),
         }
@@ -300,72 +338,48 @@ class MuleAccountDetector:
 
     def score_account(self, account_id: str) -> dict:
         """
-        Compute anomaly score for a single account.
+        Compute anomaly score for a single account using ONE Neo4j query.
         Returns a dict with anomaly_score, indicators, and explanation.
         """
         if not self.is_trained:
             return {"account_id": account_id, "anomaly_score": 0, "error": "Detector not trained"}
 
-        now = datetime.utcnow()
-        since_30d = (now - timedelta(days=30)).isoformat()
+        since_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
 
-        # ── Step 1: Fetch account statistics ──────────────────────────────────
         with neo4j_session() as s:
-            stats_row = s.run(
-                ACCOUNT_STATS_QUERY,
+            row = s.run(
+                SINGLE_ACCOUNT_QUERY,
                 account_id=account_id,
                 since_30d=since_30d,
             ).single()
-            if stats_row is None:
-                return {"account_id": account_id, "anomaly_score": 0, "error": "Not found"}
-            stats = dict(stats_row)
 
-            # Fetch transaction features (up to 200 recent)
-            txn_records = list(s.run(TXN_FEATURES_QUERY, account_id=account_id))
+        if row is None:
+            return {"account_id": account_id, "anomaly_score": 0, "error": "Not found"}
 
-        # ── Step 2: KNN distance on transaction features ───────────────────────
-        knn_anomaly = 0.0
-        if txn_records:
-            feature_rows = []
-            for rec in txn_records:
-                try:
-                    txn = dict(rec["t"])
-                    graph_data = {
-                        "sender":           dict(rec["sender"] or {}),
-                        "receiver":         dict(rec["receiver"] or {}) if rec["receiver"] else {},
-                        "sender_customer":  dict(rec["sender_customer"] or {}) if rec["sender_customer"] else {},
-                        "receiver_customer":dict(rec["receiver_customer"] or {}) if rec["receiver_customer"] else {},
-                        "device":           dict(rec["device"] or {}) if rec["device"] else {},
-                        "ip":               dict(rec["ip"] or {}) if rec["ip"] else {},
-                        "merchant":         {},
-                        "beneficiary":      dict(rec["beneficiary"] or {}) if rec["beneficiary"] else {},
-                        "txn_count_1h": 0, "txn_count_24h": 0, "txn_count_7d": 0,
-                        "total_amount_24h": 0.0, "total_amount_7d": 0.0,
-                        "structuring_count_24h": 0, "round_trip_count": 0,
-                        "shared_device_user_count": 1, "network_hop_count": 1,
-                    }
-                    fv = extract_features(txn, graph_data)
-                    feature_rows.append(fv.to_ml_array())
-                except Exception:
-                    continue
+        stats = dict(row)
+        return self._score_from_stats(stats)
 
-            if feature_rows:
-                X_txn = np.array(feature_rows, dtype=np.float32)
-                X_scaled = self._scaler.transform(X_txn).astype(np.float32)
-                mean_dists = self._query_distances(X_scaled)
-                knn_anomaly = self.anomaly_score_from_dist(float(mean_dists.mean()))
+    def _score_from_stats(self, stats: dict) -> dict:
+        """Score an account given pre-fetched stats dict."""
+        account_id = stats.get("id", "unknown")
 
-        # ── Step 3: Rule-based mule indicators ────────────────────────────────
-        out_vol  = float(stats.get("out_volume") or 0)
-        in_vol   = float(stats.get("in_volume")  or 0)
-        ptr      = out_vol / max(in_vol, 1)             # pass-through ratio
-        u_send   = int(stats.get("unique_senders_30d") or 0)
-        struct   = int(stats.get("structuring_30d")    or 0)
-        out_30   = int(stats.get("out_30d")            or 0)
+        # ── KNN distance score ────────────────────────────────────────────────
+        fv = _stats_to_feature_vector(stats).reshape(1, -1)
+        X_s = self._scaler.transform(fv).astype(np.float32)
+        dists = self._query_distances(X_s)
+        knn_anomaly = self.anomaly_score_from_dist(float(dists[0]))
 
-        is_pass_through = 0.8 <= ptr <= 1.2 and in_vol > 5000
-        high_sender_count = u_send >= 5
-        structuring_risk  = struct >= 2
+        # ── Rule-based mule indicators ────────────────────────────────────────
+        out_vol = float(stats.get("out_volume") or 0)
+        in_vol  = float(stats.get("in_volume")  or 0)
+        ptr     = out_vol / max(in_vol, 1)
+        u_send  = int(stats.get("unique_senders") or 0)
+        struct  = int(stats.get("structuring") or 0)
+        out_30  = int(stats.get("out_30d") or 0)
+
+        is_pass_through    = 0.8 <= ptr <= 1.2 and in_vol > 5000
+        high_sender_count  = u_send >= 5
+        structuring_risk   = struct >= 2
         rapid_disbursement = out_30 >= 10 and ptr > 0.7
 
         rule_score = 0
@@ -374,7 +388,6 @@ class MuleAccountDetector:
         if structuring_risk:    rule_score += 25
         if rapid_disbursement:  rule_score += 15
 
-        # ── Step 4: Composite score ────────────────────────────────────────────
         composite = round(0.5 * knn_anomaly + 0.5 * rule_score, 1)
 
         indicators = []
@@ -401,53 +414,91 @@ class MuleAccountDetector:
 
     def scan_all_accounts(
         self,
-        batch_size: int = 200,
+        batch_size: int = 500,
         force: bool = False,
+        max_accounts: int = 5_000,
         progress_cb=None,
     ) -> list[dict]:
         """
-        Score all accounts in Neo4j and persist results as Account properties.
+        Score up to max_accounts accounts using bulk Cypher queries.
+
+        Each batch fetches stats for `batch_size` accounts in one Cypher call,
+        scores them in Python, then writes results back in one UNWIND statement.
+        This avoids the N+1 query problem of per-account scoring.
+
+        max_accounts — hard cap (default 5 000). Set to 0 for unlimited.
         Returns list of suspect accounts (anomaly_score >= 40).
         """
-        query = BATCH_ALL_ACCOUNTS_QUERY if force else BATCH_ACCOUNTS_QUERY
+        if not self.is_trained:
+            raise RuntimeError("Detector not trained. Call fit() first.")
 
-        # Count
-        with neo4j_session() as s:
-            total = s.run("MATCH (a:Account) RETURN count(a) AS n").single()["n"]
+        scan_query = _BATCH_SCAN_FORCE_QUERY if force else _BATCH_SCAN_QUERY
+        since_30d  = (datetime.utcnow() - timedelta(days=30)).isoformat()
 
-        results = []
+        cap = max_accounts if max_accounts > 0 else 10_000_000
+        suspects: list[dict] = []
         processed = 0
-        for skip in range(0, total, batch_size):
-            with neo4j_session() as s:
-                ids = [r["id"] for r in s.run(query, skip=skip, limit=batch_size)]
 
-            for account_id in ids:
+        for skip in range(0, cap, batch_size):
+            fetch = min(batch_size, cap - skip)
+            with neo4j_session() as s:
+                rows = list(s.run(scan_query, since_30d=since_30d, skip=skip, limit=fetch))
+
+            if not rows:
+                break
+
+            # Score the entire batch in Python (no more Neo4j calls)
+            batch_results: list[dict] = []
+            for rec in rows:
                 try:
-                    result = self.score_account(account_id)
-                    # Persist to Neo4j
-                    with neo4j_session() as s:
-                        s.run("""
-                            MATCH (a:Account {id: $id})
-                            SET a.anomaly_score    = $score,
-                                a.mule_suspect     = $suspect,
-                                a.mule_indicators  = $indicators,
-                                a.anomaly_scored_at = $ts
-                        """,
-                        id=account_id,
-                        score=result["anomaly_score"],
-                        suspect=result["is_mule_suspect"],
-                        indicators=result["indicators"],
-                        ts=datetime.utcnow().isoformat())
-                    if result["is_mule_suspect"]:
-                        results.append(result)
+                    result = self._score_from_stats(dict(rec))
+                    batch_results.append(result)
                 except Exception:
                     pass
 
-            processed += len(ids)
-            if progress_cb:
-                progress_cb(processed, total)
+            if not batch_results:
+                processed += len(rows)
+                if progress_cb:
+                    progress_cb(processed, cap)
+                continue
 
-        return results
+            # Persist back to Neo4j in a single UNWIND
+            ts = datetime.utcnow().isoformat()
+            write_data = [
+                {
+                    "id":         r["account_id"],
+                    "score":      r["anomaly_score"],
+                    "suspect":    r["is_mule_suspect"],
+                    "indicators": r["indicators"],
+                    "ts":         ts,
+                }
+                for r in batch_results
+            ]
+            with neo4j_session() as s:
+                s.run(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (a:Account {id: row.id})
+                    SET a.anomaly_score     = row.score,
+                        a.mule_suspect      = row.suspect,
+                        a.mule_indicators   = row.indicators,
+                        a.anomaly_scored_at = row.ts
+                    """,
+                    rows=write_data,
+                )
+
+            suspects.extend(r for r in batch_results if r["is_mule_suspect"])
+            processed += len(rows)
+            print(f"  [Anomaly] Scanned {processed:,} accounts, "
+                  f"{len(suspects):,} suspects so far…")
+
+            if progress_cb:
+                progress_cb(processed, cap)
+
+            if len(rows) < fetch:
+                break  # no more accounts to fetch
+
+        return suspects
 
     # ── Persistence ────────────────────────────────────────────────────────────
 

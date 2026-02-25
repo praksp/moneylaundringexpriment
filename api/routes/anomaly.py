@@ -233,16 +233,34 @@ async def anomaly_summary():
 # ── Training and scanning endpoints ───────────────────────────────────────────
 
 @router.post("/train", dependencies=[Depends(require_admin)])
-async def train_anomaly_detector(background_tasks: BackgroundTasks):
+async def train_anomaly_detector(
+    background_tasks: BackgroundTasks,
+    max_normal: int = Query(
+        default=5_000,
+        ge=500,
+        le=50_000,
+        description="Max normal transactions to index (500–50 000). "
+                    "Lower = faster; 5 000 is recommended.",
+    ),
+    max_accounts: int = Query(
+        default=5_000,
+        ge=100,
+        le=50_000,
+        description="Max accounts to scan after training.",
+    ),
+):
     """
-    (Re)train the KNN anomaly detector on all normal transactions
-    and run a full account scan. Runs in background.
+    (Re)train the KNN anomaly detector on a sample of normal transactions,
+    then scan a sample of accounts.  Runs in background.
     """
-    background_tasks.add_task(_train_and_scan)
+    background_tasks.add_task(_train_and_scan, max_normal, max_accounts)
     return {
         "status": "started",
-        "message": "Anomaly detector training started in background. "
-                   "Check /anomaly/summary for progress.",
+        "message": (
+            f"Anomaly detector training started "
+            f"(max_normal={max_normal:,}, max_accounts={max_accounts:,}). "
+            "Check /anomaly/summary for progress."
+        ),
     }
 
 
@@ -250,9 +268,15 @@ async def train_anomaly_detector(background_tasks: BackgroundTasks):
 async def scan_accounts(
     background_tasks: BackgroundTasks,
     force: bool = Query(default=False, description="Re-score already-scored accounts"),
+    max_accounts: int = Query(
+        default=5_000,
+        ge=100,
+        le=50_000,
+        description="Max accounts to score in this run.",
+    ),
 ):
     """
-    Run anomaly scoring on all accounts using the trained detector.
+    Run anomaly scoring on accounts using the trained detector.
     Use force=true to re-score accounts that already have scores.
     """
     detector = get_detector()
@@ -261,40 +285,34 @@ async def scan_accounts(
             503,
             "Anomaly detector not trained yet. POST /anomaly/train first.",
         )
-    background_tasks.add_task(_scan_accounts, force)
+    background_tasks.add_task(_scan_accounts, force, max_accounts)
     return {
         "status": "started",
-        "message": f"Account scan started (force={force}). "
-                   "Results available at /anomaly/suspects.",
+        "message": (
+            f"Account scan started (force={force}, max={max_accounts:,}). "
+            "Results available at /anomaly/suspects."
+        ),
     }
 
 
-def _train_and_scan():
-    """Background task: train detector + scan all accounts."""
-    import numpy as np
-    from ml.train import build_training_data
+def _train_and_scan(max_normal: int = 5_000, max_accounts: int = 5_000):
+    """Background task: train detector on a sample, then scan a sample of accounts."""
+    from ml.anomaly import MuleAccountDetector
 
-    print("[Anomaly] Loading training data from Neo4j…")
-    X, y, _ = build_training_data(page_size=10_000)
-    detector = MuleAccountDetector_()
-    metrics  = detector.fit(X, y)
+    print(f"[Anomaly] Training detector on up to {max_normal:,} normal transactions…")
+    detector = MuleAccountDetector()
+    metrics  = detector.fit(max_normal=max_normal)
     detector.save()
     reset_detector()
     print(f"[Anomaly] Detector trained: {metrics}")
 
-    print("[Anomaly] Scanning all accounts…")
+    print(f"[Anomaly] Scanning up to {max_accounts:,} accounts…")
     fresh = get_detector()
-    suspects = fresh.scan_all_accounts(batch_size=100, force=True)
+    suspects = fresh.scan_all_accounts(batch_size=100, force=True, max_accounts=max_accounts)
     print(f"[Anomaly] Scan complete. {len(suspects)} mule suspects found.")
 
 
-def _scan_accounts(force: bool):
+def _scan_accounts(force: bool, max_accounts: int = 5_000):
     detector = get_detector()
-    suspects = detector.scan_all_accounts(batch_size=100, force=force)
+    suspects = detector.scan_all_accounts(batch_size=100, force=force, max_accounts=max_accounts)
     print(f"[Anomaly] Scan complete. {len(suspects)} mule suspects found.")
-
-
-# avoid circular import — import at use time
-def MuleAccountDetector_():
-    from ml.anomaly import MuleAccountDetector
-    return MuleAccountDetector()
