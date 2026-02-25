@@ -6,6 +6,10 @@ All endpoints in this router require the requesting user to hold the
 is only visible to admins.  Viewer-role users are directed to the
 /transactions/aggregate endpoint instead.
 """
+import asyncio
+import dataclasses
+import json
+
 from fastapi import APIRouter, HTTPException, Query, Depends
 from profiles.customer_profile import (
     build_customer_profile, list_customers, get_customer_transactions_page,
@@ -17,8 +21,7 @@ from store.feature_store import (
 from db.client import neo4j_session
 from auth.dependencies import require_admin
 from auth.models import UserInDB
-import dataclasses
-import json
+from api.cache import get_cached, set_cached
 
 router = APIRouter(prefix="/profiles", tags=["Customer Profiles"])
 
@@ -43,7 +46,16 @@ async def list_all_customers(
     _admin: UserInDB = Depends(require_admin),
 ):
     """List customers with summary info. Supports name search and risk-tier filter. Requires admin role."""
-    return list_customers(skip=skip, limit=limit, risk_tier=risk_tier, search=search)
+    # Cache paginated lists for 60 s (keyed by all params)
+    cache_key = f"customer_list:{skip}:{limit}:{risk_tier}:{search}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: list_customers(skip=skip, limit=limit, risk_tier=risk_tier, search=search)
+    )
+    set_cached(cache_key, result, ttl=60)
+    return result
 
 
 @router.get("/high-risk-accounts")
@@ -52,7 +64,15 @@ async def get_high_risk_accounts(
     _admin: UserInDB = Depends(require_admin),
 ):
     """Accounts flagged as likely mules or high-risk by the feature store. Requires admin role."""
-    return {"accounts": list_high_risk_accounts(limit=limit)}
+    cache_key = f"high_risk_accounts:{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return {"accounts": cached}
+    accounts = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: list_high_risk_accounts(limit=limit)
+    )
+    set_cached(cache_key, accounts, ttl=180)
+    return {"accounts": accounts}
 
 
 @router.get("/{customer_id}")
@@ -65,10 +85,18 @@ async def get_customer_profile(
     risk profile, network connections, and mule indicators.
     Requires admin role — contains PII.
     """
-    profile = build_customer_profile(customer_id)
+    cache_key = f"profile:{customer_id}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+    profile = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: build_customer_profile(customer_id)
+    )
     if profile is None:
         raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
-    return _serialize(profile)
+    result = _serialize(profile)
+    set_cached(cache_key, result, ttl=120)
+    return result
 
 
 @router.post("/{customer_id}/accounts/{account_id}/feature-snapshot")

@@ -1,3 +1,4 @@
+import React, { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
@@ -241,31 +242,157 @@ export default function ModelMonitor() {
 
       {/* Drift history */}
       {driftHistory.data?.reports?.length > 0 && (
-        <div className="bg-slate-900 rounded-xl border border-slate-800 p-5">
-          <h3 className="text-sm font-semibold text-slate-300 mb-4">Drift Report History</h3>
+        <div className="space-y-4">
+          {driftHistory.data.reports.map((r: Record<string, unknown>, i: number) => {
+            const lvl = (r.overall_alert_level as string) as keyof typeof ALERT_COLORS
+            const causes = (r.drift_causes as DriftCause[] | undefined) ?? []
+            const topFeatures = (r.top_drifted_features as TopDriftedFeature[] | undefined) ?? []
+            return (
+              <DriftReportCard key={i} report={r} lvl={lvl} causes={causes} topFeatures={topFeatures} />
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface DriftCause {
+  category: string
+  severity: string
+  psi: number | null
+  title: string
+  detail: string
+  recommendation: string
+  feature?: string
+}
+
+interface TopDriftedFeature {
+  feature: string
+  psi: number
+  alert: string
+  ref_mean: number
+  cur_mean: number
+  mean_drift: number
+  direction: string
+}
+
+// ── Drift Report Card ─────────────────────────────────────────────────────────
+
+function DriftReportCard({
+  report, lvl, causes, topFeatures,
+}: {
+  report: Record<string, unknown>
+  lvl: keyof typeof ALERT_COLORS
+  causes: DriftCause[]
+  topFeatures: TopDriftedFeature[]
+}) {
+  const [expanded, setExpanded] = React.useState(false)
+
+  const CAUSE_BG: Record<string, string> = {
+    OK:       'bg-emerald-500/10 border-emerald-500/30',
+    WARNING:  'bg-amber-500/10 border-amber-500/30',
+    CRITICAL: 'bg-red-500/10 border-red-500/30',
+  }
+  const CAUSE_ICON: Record<string, string> = {
+    OK: '✓', WARNING: '⚠', CRITICAL: '✕',
+  }
+
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 p-5">
+      {/* Header row */}
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <span className={clsx('font-bold text-sm', ALERT_COLORS[lvl])}>
+            {CAUSE_ICON[lvl] ?? '?'} {lvl}
+          </span>
+          <span className="text-slate-400 text-xs">
+            {String(report.computed_at).slice(0, 16).replace('T', ' ')}
+          </span>
+          {report.drift_detected && (
+            <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full border border-red-500/30">
+              Drift Detected
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-4 text-xs text-slate-400">
+          <span>Score PSI: <span className="text-white">{Number(report.score_distribution_psi).toFixed(3)}</span></span>
+          <span>Max Feature PSI: <span className="text-white">{Number(report.max_feature_psi).toFixed(3)}</span></span>
+          <span className="text-amber-400">{report.features_in_warning as number} warn</span>
+          <span className="text-red-400">{report.features_in_critical as number} crit</span>
+          <button
+            onClick={() => setExpanded(x => !x)}
+            className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 transition-colors"
+          >
+            {expanded ? 'Collapse' : 'Details →'}
+          </button>
+        </div>
+      </div>
+
+      {/* Drift causes — always shown (summary) */}
+      {causes.length > 0 && (
+        <div className="space-y-2">
+          {causes.slice(0, expanded ? causes.length : 2).map((c, j) => (
+            <div key={j} className={clsx('rounded-lg border p-3', CAUSE_BG[c.severity] ?? 'bg-slate-800 border-slate-700')}>
+              <div className="flex items-start gap-2">
+                <span className={clsx('text-xs font-bold mt-0.5', ALERT_COLORS[c.severity as keyof typeof ALERT_COLORS] ?? 'text-slate-400')}>
+                  [{c.category}]
+                </span>
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-slate-200">{c.title}</p>
+                  {expanded && (
+                    <>
+                      <p className="text-xs text-slate-400 mt-1">{c.detail}</p>
+                      <p className="text-xs text-blue-400 mt-1.5">
+                        → {c.recommendation}
+                      </p>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+          {!expanded && causes.length > 2 && (
+            <p className="text-xs text-slate-500 text-center">
+              +{causes.length - 2} more causes — click Details to expand
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Top drifted features table (expanded only) */}
+      {expanded && topFeatures.length > 0 && (
+        <div className="mt-4">
+          <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">
+            Top Drifted Features
+          </h4>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
-                <tr className="text-slate-400 border-b border-slate-800">
-                  {['Computed At', 'Score PSI', 'Max Feature PSI', 'Warning', 'Critical', 'Alert'].map(h => (
-                    <th key={h} className="text-left py-2 pr-4 font-medium">{h}</th>
+                <tr className="text-slate-500 border-b border-slate-800">
+                  {['Feature', 'PSI', 'Alert', 'Training Mean', 'Current Mean', 'Change'].map(h => (
+                    <th key={h} className="text-left py-1.5 pr-3 font-medium">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {driftHistory.data.reports.map((r: Record<string, unknown>, i: number) => {
-                  const lvl = (r.overall_alert_level as string) as keyof typeof ALERT_COLORS
-                  return (
-                    <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/30">
-                      <td className="py-2 pr-4 text-slate-300">{String(r.computed_at).slice(0, 16)}</td>
-                      <td className="py-2 pr-4">{Number(r.score_distribution_psi).toFixed(3)}</td>
-                      <td className="py-2 pr-4">{Number(r.max_feature_psi).toFixed(3)}</td>
-                      <td className="py-2 pr-4 text-amber-400">{r.features_in_warning as number}</td>
-                      <td className="py-2 pr-4 text-red-400">{r.features_in_critical as number}</td>
-                      <td className={clsx('py-2 font-semibold', ALERT_COLORS[lvl])}>{lvl}</td>
-                    </tr>
-                  )
-                })}
+                {topFeatures.map((f, fi) => (
+                  <tr key={fi} className="border-b border-slate-800/40">
+                    <td className="py-1.5 pr-3 text-slate-300 font-mono">{f.feature.replace(/_/g, ' ')}</td>
+                    <td className="py-1.5 pr-3 tabular-nums">{f.psi.toFixed(4)}</td>
+                    <td className={clsx('py-1.5 pr-3 font-medium', ALERT_COLORS[f.alert as keyof typeof ALERT_COLORS] ?? 'text-slate-400')}>
+                      {f.alert}
+                    </td>
+                    <td className="py-1.5 pr-3 tabular-nums text-slate-400">{f.ref_mean.toFixed(3)}</td>
+                    <td className="py-1.5 pr-3 tabular-nums text-slate-300">{f.cur_mean.toFixed(3)}</td>
+                    <td className={clsx('py-1.5 tabular-nums font-medium',
+                      f.mean_drift > 0 ? 'text-red-400' : 'text-emerald-400')}>
+                      {f.direction} ({f.mean_drift > 0 ? '+' : ''}{f.mean_drift.toFixed(3)})
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

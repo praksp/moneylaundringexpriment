@@ -31,7 +31,12 @@ RETURN t, sender, receiver, sc AS sender_customer, rc AS receiver_customer,
 
 @router.get("/stats/summary")
 async def transaction_stats():
-    """Aggregate statistics about the transaction dataset."""
+    """Aggregate statistics about the transaction dataset. Cached for 2 minutes."""
+    from api.cache import get_cached, set_cached
+    cached = get_cached("txn_stats_summary")
+    if cached is not None:
+        return cached
+
     with neo4j_session() as session:
         stats = {}
 
@@ -59,6 +64,7 @@ async def transaction_stats():
         r5 = session.run("MATCH (n:Account) RETURN count(n) AS c").single()
         stats["total_accounts"] = r5["c"] if r5 else 0
 
+    set_cached("txn_stats_summary", stats, ttl=120)
     return stats
 
 
@@ -116,97 +122,107 @@ async def get_transaction(txn_id: str):
     }
 
 
-@router.get("/aggregate/world-map", dependencies=[Depends(require_viewer_or_admin)])
-async def aggregate_world_map():
+def _build_world_map() -> dict:
     """
-    Aggregated transaction heatmap by country — no customer PII.
-    Available to all authenticated users (admin + viewer).
-    Returns per-country totals, fraud counts, risk distribution,
-    and transaction volume for the global heatmap.
+    Aggregate transaction data by country entirely in Neo4j.
+    Returns ~71 rows (one per country) instead of streaming 961k rows to Python.
+    Result is cached for 5 minutes.
     """
+    from api.cache import get_cached, set_cached
+    cached = get_cached("world_map")
+    if cached is not None:
+        return cached
+
     with neo4j_session() as session:
-        rows = session.run("""
-            MATCH (a:Account)-[:INITIATED]->(t:Transaction)
-            OPTIONAL MATCH (a)-[:BASED_IN]->(sc:Country)
-            OPTIONAL MATCH (t)-[:CREDITED_TO]->(ra:Account)-[:BASED_IN]->(rc:Country)
-            OPTIONAL MATCH (t)-[:SENT_TO_EXTERNAL]->(b:BeneficiaryAccount)
-            OPTIONAL MATCH (t)-[:HAS_PREDICTION]->(pl:PredictionLog)
-            RETURN
-                sc.code AS sender_cc, sc.name AS sender_name,
-                sc.fatf_risk AS sender_fatf,
-                rc.code AS recv_cc, rc.name AS recv_name,
-                rc.fatf_risk AS recv_fatf,
-                b.country AS bene_cc,
-                t.is_fraud AS is_fraud, t.fraud_type AS fraud_type,
-                t.amount AS amount, t.type AS txn_type,
-                COALESCE(pl.final_score,
-                    CASE t.is_fraud WHEN true THEN 720 ELSE null END) AS score,
-                COALESCE(pl.outcome,
-                    CASE t.is_fraud WHEN true THEN 'DECLINE' ELSE null END) AS outcome
+        # Sender-country aggregation
+        sender_rows = session.run("""
+            MATCH (a:Account)-[:BASED_IN]->(c:Country)
+            MATCH (a)-[:INITIATED]->(t:Transaction)
+            WITH c,
+                 count(t)                                              AS txn_count,
+                 sum(t.amount)                                         AS total_amount,
+                 sum(CASE WHEN t.is_fraud = true THEN 1 ELSE 0 END)   AS fraud_count,
+                 collect(DISTINCT t.fraud_type)                        AS fraud_types,
+                 collect(DISTINCT t.transaction_type)                  AS txn_types
+            RETURN c.code AS cc, c.name AS name, c.fatf_risk AS fatf,
+                   txn_count, total_amount, fraud_count,
+                   fraud_types, txn_types,
+                   'sender' AS direction
         """).data()
 
-    country_stats: dict[str, dict] = {}
+        # Receiver-country aggregation
+        recv_rows = session.run("""
+            MATCH (ra:Account)-[:BASED_IN]->(c:Country)
+            MATCH (t:Transaction)-[:CREDITED_TO]->(ra)
+            WITH c,
+                 count(t)                                              AS txn_count,
+                 sum(t.amount)                                         AS total_amount,
+                 sum(CASE WHEN t.is_fraud = true THEN 1 ELSE 0 END)   AS fraud_count,
+                 collect(DISTINCT t.fraud_type)                        AS fraud_types,
+                 collect(DISTINCT t.transaction_type)                  AS txn_types
+            RETURN c.code AS cc, c.name AS name, c.fatf_risk AS fatf,
+                   txn_count, total_amount, fraud_count,
+                   fraud_types, txn_types,
+                   'receiver' AS direction
+        """).data()
 
-    def _add(code, name, fatf, amount, score, is_fraud, fraud_type, txn_type, direction):
-        if not code:
-            return
-        if code not in country_stats:
-            country_stats[code] = {
-                "code": code, "name": name or code,
-                "fatf_risk": fatf or "LOW",
+        # Overall transaction stats (fast with indexed fields)
+        stats_row = session.run("""
+            MATCH (t:Transaction)
+            RETURN count(t) AS total,
+                   sum(CASE WHEN t.is_fraud = true THEN 1 ELSE 0 END) AS fraud_total
+        """).single()
+
+    # Merge into per-country buckets
+    country_stats: dict[str, dict] = {}
+    for row in sender_rows + recv_rows:
+        cc = row.get("cc")
+        if not cc:
+            continue
+        if cc not in country_stats:
+            country_stats[cc] = {
+                "code": cc,
+                "name": row.get("name") or cc,
+                "fatf_risk": row.get("fatf") or "LOW",
                 "txn_count": 0, "fraud_count": 0,
-                "total_amount": 0.0, "scores": [],
-                "directions": set(), "fraud_types": set(),
+                "total_amount": 0.0,
+                "directions": set(),
+                "fraud_types": set(),
                 "txn_types": set(),
             }
-        s = country_stats[code]
-        s["txn_count"] += 1
-        s["total_amount"] += float(amount or 0)
-        if is_fraud:
-            s["fraud_count"] += 1
-            if fraud_type:
-                s["fraud_types"].add(fraud_type)
-        if score is not None:
-            s["scores"].append(int(score))
-        s["directions"].add(direction)
-        if txn_type:
-            s["txn_types"].add(txn_type)
-
-    for r in rows:
-        amt = r.get("amount", 0) or 0
-        fraud = bool(r.get("is_fraud", False))
-        ftype = r.get("fraud_type")
-        score = r.get("score")
-        ttype = r.get("txn_type")
-        _add(r.get("sender_cc"), r.get("sender_name"), r.get("sender_fatf"),
-             amt, score, fraud, ftype, ttype, "sender")
-        _add(r.get("recv_cc"), r.get("recv_name"), r.get("recv_fatf"),
-             amt, score, fraud, ftype, ttype, "receiver")
-        if r.get("bene_cc"):
-            _add(r["bene_cc"], r["bene_cc"], "HIGH",
-                 amt, score, fraud, ftype, ttype, "beneficiary")
+        s = country_stats[cc]
+        s["txn_count"]   += int(row.get("txn_count") or 0)
+        s["fraud_count"] += int(row.get("fraud_count") or 0)
+        s["total_amount"] += float(row.get("total_amount") or 0)
+        s["directions"].add(row.get("direction", ""))
+        for ft in (row.get("fraud_types") or []):
+            if ft:
+                s["fraud_types"].add(ft)
+        for tt in (row.get("txn_types") or []):
+            if tt:
+                s["txn_types"].add(tt)
 
     result = []
     for s in country_stats.values():
-        scores = s["scores"]
-        avg_score = round(sum(scores) / len(scores)) if scores else None
-        max_score = max(scores) if scores else None
-        fraud_pct = s["fraud_count"] / s["txn_count"] if s["txn_count"] else 0
-        if max_score is not None and max_score >= 700:
+        fraud_pct = s["fraud_count"] / max(s["txn_count"], 1)
+        # Derive risk level from fraud % and FATF tier
+        fatf = s.get("fatf_risk", "LOW")
+        if fraud_pct >= 0.25 or fatf == "BLACKLIST":
             risk_level = "CRITICAL"
-        elif max_score is not None and max_score >= 400:
+        elif fraud_pct >= 0.10 or fatf == "HIGH":
             risk_level = "HIGH"
-        elif fraud_pct > 0:
+        elif fraud_pct > 0 or fatf == "MEDIUM":
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
+
         result.append({
-            "code": s["code"], "name": s["name"],
+            "code": s["code"],
+            "name": s["name"],
             "fatf_risk": s["fatf_risk"],
             "txn_count": s["txn_count"],
             "fraud_count": s["fraud_count"],
             "total_amount": round(s["total_amount"], 2),
-            "avg_score": avg_score, "max_score": max_score,
             "risk_level": risk_level,
             "directions": list(s["directions"]),
             "fraud_types": list(s["fraud_types"]),
@@ -215,10 +231,10 @@ async def aggregate_world_map():
 
     result.sort(key=lambda x: x["txn_count"], reverse=True)
 
-    # Summary stats (no PII)
-    total_txns = sum(r["txn_count"] for r in result)
-    total_fraud = sum(r["fraud_count"] for r in result)
-    return {
+    total_txns  = int(stats_row["total"] or 0) if stats_row else 0
+    total_fraud = int(stats_row["fraud_total"] or 0) if stats_row else 0
+
+    payload = {
         "countries": result,
         "total_countries": len(result),
         "summary": {
@@ -228,5 +244,20 @@ async def aggregate_world_map():
             "high_risk_countries": sum(1 for r in result if r["risk_level"] in ("HIGH", "CRITICAL")),
         },
     }
+    set_cached("world_map", payload, ttl=300)   # 5-minute cache
+    return payload
+
+
+@router.get("/aggregate/world-map", dependencies=[Depends(require_viewer_or_admin)])
+async def aggregate_world_map():
+    """
+    Aggregated transaction heatmap by country — no customer PII.
+    Available to all authenticated users (admin + viewer).
+    Aggregation is done inside Neo4j (returns ~71 rows, not 961k).
+    Result is cached for 5 minutes.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _build_world_map)
 
 

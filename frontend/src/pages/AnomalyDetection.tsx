@@ -75,25 +75,60 @@ function SummaryCard({ label, value, sub, icon: Icon, color }:
 
 // ── Account Detail Drawer ─────────────────────────────────────────────────────
 
-function AccountDetailDrawer({ accountId, onClose }: { accountId: string; onClose: () => void }) {
-  const { data, isLoading } = useQuery({
+function AccountDetailDrawer({
+  accountId,
+  prefill,
+  onClose,
+}: {
+  accountId: string
+  prefill?: AnomalyAccountResult
+  onClose: () => void
+}) {
+  const { data: liveData, isLoading, isError, error } = useQuery({
     queryKey: ['account-anomaly', accountId],
     queryFn: () => getAccountAnomaly(accountId),
+    retry: 1,
   })
+
+  // Use live data if available, fall back to pre-filled data from the suspects table
+  const data = liveData ?? prefill
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       <div className="w-full max-w-md bg-white shadow-2xl border-l border-gray-200 overflow-y-auto"
         onClick={e => e.stopPropagation()}>
         <div className="sticky top-0 bg-white border-b border-gray-100 px-5 py-4 flex items-center justify-between">
-          <h2 className="font-semibold text-gray-900">Account Anomaly Detail</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 rounded">✕</button>
+          <div>
+            <h2 className="font-semibold text-gray-900">Account Anomaly Detail</h2>
+            {data && <p className="text-xs text-gray-400 font-mono mt-0.5">{accountId.slice(0,8)}…</p>}
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 rounded text-lg leading-none">✕</button>
         </div>
 
-        {isLoading && (
+        {isLoading && !prefill && (
           <div className="p-8 text-center text-gray-400">
             <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
-            Scoring account…
+            <p className="text-sm">Loading account details…</p>
+          </div>
+        )}
+
+        {isError && !prefill && (
+          <div className="p-6 m-4 bg-red-50 border border-red-200 rounded-xl text-sm">
+            <p className="font-semibold text-red-700 mb-1">Could not load live score</p>
+            <p className="text-red-600 text-xs">
+              {(error as Error)?.message?.includes('503')
+                ? 'The anomaly detector is not trained yet. Click "Train Detector" first.'
+                : 'An error occurred fetching account details.'}
+            </p>
+          </div>
+        )}
+
+        {isLoading && prefill && (
+          <div className="px-5 pt-3 pb-0">
+            <div className="flex items-center gap-2 text-xs text-indigo-500 bg-indigo-50 rounded-lg px-3 py-2">
+              <RefreshCw className="w-3 h-3 animate-spin" />
+              Refreshing with live score…
+            </div>
           </div>
         )}
 
@@ -103,85 +138,116 @@ function AccountDetailDrawer({ accountId, onClose }: { accountId: string; onClos
             <div className="flex flex-col items-center bg-gray-50 rounded-xl p-4">
               <ScoreGauge score={data.anomaly_score} />
               <p className="text-sm text-gray-500 mt-1">Composite Mule Score</p>
+              <div className="mt-2 flex gap-2 text-xs">
+                <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">
+                  KNN: {(data.knn_distance_score ?? 0).toFixed(1)}
+                </span>
+                <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full">
+                  Rules: {data.rule_score ?? 0}
+                </span>
+              </div>
             </div>
 
             {/* Account info */}
             <div className="grid grid-cols-2 gap-2 text-sm">
-              {[
-                ['Account', data.account_number ?? '—'],
-                ['Bank',    data.bank_name ?? '—'],
-                ['Type',    data.account_type ?? '—'],
-                ['Country', data.customer_country ?? '—'],
-                ['Customer', data.customer_name ?? '—'],
-              ].map(([k, v]) => (
-                <div key={k} className="bg-gray-50 rounded-lg p-2">
+              {([
+                ['Account #', data.account_number ?? '—'],
+                ['Bank',      data.bank_name ?? '—'],
+                ['Type',      data.account_type ?? '—'],
+                ['Country',   data.customer_country ?? '—'],
+                ['Customer',  data.customer_name ?? '—'],
+                ['Suspect',   data.is_mule_suspect ? '⚠ Yes' : '✓ No'],
+              ] as [string, string][]).map(([k, v]) => (
+                <div key={k} className={`rounded-lg p-2 ${
+                  k === 'Suspect' && data.is_mule_suspect ? 'bg-red-50' : 'bg-gray-50'
+                }`}>
                   <p className="text-gray-500 text-xs">{k}</p>
-                  <p className="font-medium text-gray-800 truncate">{v}</p>
+                  <p className={`font-medium truncate ${
+                    k === 'Suspect' && data.is_mule_suspect ? 'text-red-700' : 'text-gray-800'
+                  }`}>{v}</p>
                 </div>
               ))}
             </div>
 
-            {/* Score breakdown */}
+            {/* Score breakdown bars */}
             <div>
               <h3 className="text-sm font-semibold text-gray-700 mb-2">Score Breakdown</h3>
               <div className="space-y-2">
-                {[
-                  { label: 'KNN Distance Score', val: data.knn_distance_score, color: 'bg-blue-500' },
-                  { label: 'Rule-based Score',   val: data.rule_score,         color: 'bg-purple-500' },
-                  { label: 'Composite Score',    val: data.anomaly_score,      color: 'bg-orange-500' },
-                ].map(({ label, val, color }) => (
+                {([
+                  { label: 'KNN Distance Score', val: data.knn_distance_score ?? 0, color: 'bg-blue-500' },
+                  { label: 'Rule-based Score',   val: data.rule_score ?? 0,         color: 'bg-purple-500' },
+                  { label: 'Composite Score',    val: data.anomaly_score,           color: 'bg-orange-500' },
+                ] as { label: string; val: number; color: string }[]).map(({ label, val, color }) => (
                   <div key={label}>
                     <div className="flex justify-between text-xs text-gray-500 mb-0.5">
                       <span>{label}</span>
-                      <span className="font-medium">{val.toFixed(1)} / 100</span>
+                      <span className="font-medium tabular-nums">{val.toFixed(1)} / 100</span>
                     </div>
                     <div className="h-2 rounded-full bg-gray-100">
-                      <div className={`h-2 rounded-full ${color}`} style={{ width: `${Math.min(val, 100)}%` }} />
+                      <div className={`h-2 rounded-full ${color} transition-all`}
+                        style={{ width: `${Math.min(val, 100)}%` }} />
                     </div>
                   </div>
                 ))}
               </div>
             </div>
 
-            {/* Indicators */}
-            {data.indicators.length > 0 && (
+            {/* Risk indicators */}
+            {(data.indicators?.length ?? 0) > 0 ? (
               <div>
-                <h3 className="text-sm font-semibold text-gray-700 mb-2">Risk Indicators</h3>
-                <div className="flex flex-wrap gap-2">
+                <h3 className="text-sm font-semibold text-gray-700 mb-2">
+                  Risk Indicators ({data.indicators.length})
+                </h3>
+                <div className="flex flex-wrap gap-2 mb-3">
                   {data.indicators.map(ind => <IndicatorBadge key={ind} ind={ind} />)}
                 </div>
-                <div className="mt-3 space-y-2">
+                <div className="space-y-2">
                   {data.indicators.map(ind => {
                     const meta = INDICATOR_META[ind]
                     return meta ? (
-                      <div key={ind} className="flex gap-2 text-xs text-gray-600 bg-yellow-50 rounded-lg p-2">
+                      <div key={ind} className="flex gap-2 text-xs text-gray-600 bg-yellow-50 border border-yellow-100 rounded-lg p-2.5">
                         <Info className="w-3.5 h-3.5 text-yellow-500 flex-shrink-0 mt-0.5" />
-                        <span>{meta.desc}</span>
+                        <div>
+                          <p className="font-medium text-gray-700">{meta.label}</p>
+                          <p className="text-gray-500 mt-0.5">{meta.desc}</p>
+                        </div>
                       </div>
                     ) : null
                   })}
                 </div>
               </div>
+            ) : (
+              <div className="bg-green-50 border border-green-100 rounded-lg p-3 text-xs text-green-700">
+                No specific rule-based indicators triggered. Anomaly score is driven by KNN distance.
+              </div>
             )}
 
-            {/* Financial stats */}
+            {/* Financial signals */}
             <div>
               <h3 className="text-sm font-semibold text-gray-700 mb-2">Financial Signals</h3>
               <div className="grid grid-cols-2 gap-2 text-sm">
-                {[
-                  ['Pass-through ratio', data.pass_through_ratio.toFixed(3)],
-                  ['Unique senders 30d', data.unique_senders_30d],
-                  ['Structuring count 30d', data.structuring_30d],
-                  ['Inbound volume', `$${data.in_volume.toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
-                  ['Outbound volume', `$${data.out_volume.toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
-                ].map(([k, v]) => (
-                  <div key={String(k)} className="bg-gray-50 rounded-lg p-2">
+                {([
+                  ['Pass-through ratio',  `${(data.pass_through_ratio ?? 0).toFixed(3)}×`],
+                  ['Unique senders 30d',  String(data.unique_senders_30d ?? 0)],
+                  ['Structuring txns 30d',String(data.structuring_30d ?? 0)],
+                  ['Inbound volume',      `$${(data.in_volume ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
+                  ['Outbound volume',     `$${(data.out_volume ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
+                  ['Net flow',            `$${((data.in_volume ?? 0) - (data.out_volume ?? 0)).toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
+                ] as [string, string][]).map(([k, v]) => (
+                  <div key={k} className="bg-gray-50 rounded-lg p-2">
                     <p className="text-gray-500 text-xs">{k}</p>
-                    <p className="font-semibold text-gray-800">{String(v)}</p>
+                    <p className="font-semibold text-gray-800 tabular-nums">{v}</p>
                   </div>
                 ))}
               </div>
             </div>
+          </div>
+        )}
+
+        {!data && !isLoading && (
+          <div className="p-8 text-center text-gray-400">
+            <AlertTriangle className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-sm">No data available for this account.</p>
           </div>
         )}
       </div>
@@ -203,6 +269,7 @@ export default function AnomalyDetection() {
   const [page, setPage]         = useState(1)
   const [search, setSearch]     = useState('')
   const [selectedAcct, setSelectedAcct] = useState<string | null>(null)
+  const [selectedPrefill, setSelectedPrefill] = useState<AnomalyAccountResult | undefined>(undefined)
   const [maxNormal, setMaxNormal]   = useState(5_000)
   const [maxAccounts, setMaxAccounts] = useState(5_000)
   const PAGE_SIZE = 50
@@ -451,7 +518,7 @@ export default function AnomalyDetection() {
                   {filtered.map((s: AnomalyAccountResult) => (
                     <tr key={s.account_id}
                       className="hover:bg-gray-50 transition-colors cursor-pointer"
-                      onClick={() => setSelectedAcct(s.account_id)}
+                      onClick={() => { setSelectedPrefill(s); setSelectedAcct(s.account_id) }}
                     >
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
@@ -489,7 +556,7 @@ export default function AnomalyDetection() {
                       <td className="px-4 py-3 text-gray-700">{s.structuring_30d}</td>
                       <td className="px-4 py-3">
                         <button
-                          onClick={e => { e.stopPropagation(); setSelectedAcct(s.account_id) }}
+                          onClick={e => { e.stopPropagation(); setSelectedPrefill(s); setSelectedAcct(s.account_id) }}
                           className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
                         >
                           Details →
@@ -577,7 +644,8 @@ export default function AnomalyDetection() {
       {selectedAcct && (
         <AccountDetailDrawer
           accountId={selectedAcct}
-          onClose={() => setSelectedAcct(null)}
+          prefill={selectedPrefill}
+          onClose={() => { setSelectedAcct(null); setSelectedPrefill(undefined) }}
         />
       )}
     </div>

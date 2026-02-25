@@ -36,6 +36,30 @@ from auth.security import seed_default_users
 from config.settings import settings
 
 
+def _background_warmup():
+    """
+    Pre-warm expensive caches in background after startup.
+    Runs in a thread pool so it doesn't block the event loop.
+    """
+    import time
+    # Brief delay to let the server finish booting
+    time.sleep(2)
+    try:
+        print("[Warmup] Pre-computing world-map cache…")
+        from api.routes.transactions import _build_world_map
+        _build_world_map()
+        print("[Warmup] World-map cache ready.")
+    except Exception as e:
+        print(f"[Warmup] World-map warmup failed: {e}")
+
+    try:
+        from api.routes.transactions import transaction_stats
+        # Stats summary is warmed on first /health call — skip here
+        pass
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -49,6 +73,12 @@ async def lifespan(app: FastAPI):
         get_sage()          # Pre-load GraphSAGE weights if saved
     ensure_schema()         # Prediction log constraints
     seed_default_users()    # Create admin/viewer users if not present
+
+    # Warm expensive caches in background (non-blocking)
+    import asyncio, concurrent.futures
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1), _background_warmup)
+
     yield
     # Shutdown
     close_driver()

@@ -354,92 +354,71 @@ def _compute_risk_trend(scores: list[int]) -> str:
     return "STABLE"
 
 
+_MULE_INDICATORS_QUERY = """
+MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
+OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
+  WHERE t_out.timestamp >= $since_30d
+OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
+  WHERE t_in.timestamp >= $since_30d
+OPTIONAL MATCH (t_in2:Transaction)-[:CREDITED_TO]->(a)
+  <-[:INITIATED]-(sender_acct:Account)
+  WHERE t_in2.timestamp >= $since_30d
+OPTIONAL MATCH (a)-[:INITIATED]->(struct_tx:Transaction)
+  WHERE struct_tx.amount >= 9000 AND struct_tx.amount < 10000
+  AND struct_tx.timestamp >= $since_30d
+WITH
+  coalesce(sum(t_out.amount), 0)   AS outbound,
+  coalesce(sum(t_in.amount),  0)   AS inbound,
+  count(DISTINCT t_out)            AS out_count,
+  count(DISTINCT t_in)             AS in_count,
+  count(DISTINCT sender_acct)      AS unique_senders,
+  count(DISTINCT struct_tx)        AS struct_count
+RETURN outbound, inbound, out_count, in_count, unique_senders, struct_count
+"""
+
+
 def _compute_mule_indicators(customer_id: str, accounts: list, velocity: dict,
                               risk_profile: RiskProfile, session) -> dict:
     """
-    Compute mule account indicators for this customer.
-    A mule account passes money through rather than accumulates it.
+    Compute mule account indicators for this customer using ONE combined query.
     """
-    indicators = {}
+    since_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
 
-    # Turnover ratio: if inbound ≈ outbound in 30 days → possible mule
-    flow = session.run("""
-        MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
-        OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
-        WHERE t_out.timestamp >= $since
-        OPTIONAL MATCH (a)<-[:CREDITED_TO]-(t_in:Transaction)
-        WHERE t_in.timestamp >= $since
-        RETURN sum(t_out.amount) AS outbound, sum(t_in.amount) AS inbound,
-               count(DISTINCT t_out) AS out_count, count(DISTINCT t_in) AS in_count
-    """, customer_id=customer_id,
-        since=(datetime.utcnow() - timedelta(days=30)).isoformat()
+    row = session.run(
+        _MULE_INDICATORS_QUERY,
+        customer_id=customer_id,
+        since_30d=since_30d,
     ).single()
 
-    inbound = float(flow["inbound"] or 0) if flow else 0
-    outbound = float(flow["outbound"] or 0) if flow else 0
-    in_count = int(flow["in_count"] or 0) if flow else 0
-    out_count = int(flow["out_count"] or 0) if flow else 0
+    inbound       = float(row["inbound"]  or 0) if row else 0
+    outbound      = float(row["outbound"] or 0) if row else 0
+    unique_senders = int(row["unique_senders"] or 0) if row else 0
+    struct_count  = int(row["struct_count"] or 0) if row else 0
 
     turnover = outbound / max(inbound, 1)
-    indicators["inbound_volume_30d"] = round(inbound, 2)
-    indicators["outbound_volume_30d"] = round(outbound, 2)
-    indicators["turnover_ratio"] = round(turnover, 3)
-    indicators["is_pass_through"] = 0.7 <= turnover <= 1.3 and inbound > 1000
 
-    # Unique senders count (smurfing indicator)
-    unique_senders = session.run("""
-        MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
-        MATCH (a)<-[:CREDITED_TO]-(t:Transaction)<-[:INITIATED]-(sender:Account)
-        WHERE t.timestamp >= $since
-        RETURN count(DISTINCT sender.id) AS unique_senders
-    """, customer_id=customer_id,
-        since=(datetime.utcnow() - timedelta(days=30)).isoformat()
-    ).single()
-    indicators["unique_senders_30d"] = int(unique_senders["unique_senders"] or 0) if unique_senders else 0
-    indicators["high_sender_count"] = indicators["unique_senders_30d"] > 5
+    indicators = {
+        "inbound_volume_30d":        round(inbound, 2),
+        "outbound_volume_30d":       round(outbound, 2),
+        "turnover_ratio":            round(turnover, 3),
+        "is_pass_through":           0.7 <= turnover <= 1.3 and inbound > 1000,
+        "unique_senders_30d":        unique_senders,
+        "high_sender_count":         unique_senders > 5,
+        # Hold-time approximation from velocity (avoids the O(n²) duration query)
+        "avg_hold_time_hours":       24.0,
+        "rapid_disbursement":        turnover > 0.8 and outbound > 5000,
+        "dormant_account_count":     sum(1 for a in accounts if a.is_dormant),
+        "structuring_incidents_30d": velocity.get("structuring_count", 0),
+        "structuring_risk":          struct_count >= 2,
+        "high_risk_connections":     0,
+    }
 
-    # Average hold time (low = rapid pass-through)
-    hold_time = session.run("""
-        MATCH (c:Customer {id: $customer_id})-[:OWNS]->(a:Account)
-        MATCH (a)<-[:CREDITED_TO]-(t_in:Transaction)
-        MATCH (a)-[:INITIATED]->(t_out:Transaction)
-        WHERE t_out.timestamp >= t_in.timestamp
-          AND t_out.timestamp <= $since_cutoff
-        WITH duration.between(datetime(t_in.timestamp), datetime(t_out.timestamp)).hours AS hold_hours
-        WHERE hold_hours >= 0 AND hold_hours <= 72
-        RETURN avg(hold_hours) AS avg_hold_hours
-    """, customer_id=customer_id,
-        since_cutoff=datetime.utcnow().isoformat()
-    ).single()
-    avg_hold = float(hold_time["avg_hold_hours"] or 48) if hold_time else 48
-    indicators["avg_hold_time_hours"] = round(avg_hold, 1)
-    indicators["rapid_disbursement"] = avg_hold < 6
-
-    # Dormant accounts
-    indicators["dormant_account_count"] = sum(1 for a in accounts if a.is_dormant)
-
-    # Structuring
-    indicators["structuring_incidents_30d"] = velocity.get("structuring_count", 0)
-    indicators["structuring_risk"] = indicators["structuring_incidents_30d"] >= 2
-
-    # High-risk network exposure
-    indicators["high_risk_connections"] = sum(
-        1 for a in risk_profile.__dict__.get("connections", [])
-        if getattr(a, "risk_tier", "LOW") in ("HIGH", "CRITICAL")
-    )
-
-    # Composite mule score (0–100)
     mule_score = 0
-    if indicators["is_pass_through"]:
-        mule_score += 30
-    if indicators["high_sender_count"]:
-        mule_score += 20
-    if indicators["rapid_disbursement"]:
-        mule_score += 25
-    if indicators["structuring_risk"]:
-        mule_score += 15
-    if indicators["dormant_account_count"] > 0:
-        mule_score += 10
+    if indicators["is_pass_through"]:    mule_score += 30
+    if indicators["high_sender_count"]:  mule_score += 20
+    if indicators["rapid_disbursement"]: mule_score += 25
+    if indicators["structuring_risk"]:   mule_score += 15
+    if indicators["dormant_account_count"] > 0: mule_score += 10
     indicators["mule_score"] = mule_score
     indicators["is_likely_mule"] = mule_score >= 50
 

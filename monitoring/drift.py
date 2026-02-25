@@ -195,6 +195,16 @@ def compute_and_store_drift_report(
     max_psi = max(all_psis) if all_psis else 0.0
     overall_alert = _alert_level(max_psi)
 
+    # ── Build human-readable drift causes ─────────────────────────────────────
+    drift_causes = _explain_drift_causes(
+        score_drift=score_drift,
+        feature_drift=feature_drift,
+        current_outcomes=current_outcomes,
+        reference_scores=reference_scores,
+        current_scores=current_scores,
+        top_drifted=top_drifted,
+    )
+
     report = {
         "id": str(uuid.uuid4()),
         "computed_at": datetime.utcnow().isoformat(),
@@ -211,9 +221,12 @@ def compute_and_store_drift_report(
                                     if v["alert_level"] == "CRITICAL"),
         "top_drifted_features": [
             {"feature": k, "psi": v["psi"], "alert": v["alert_level"],
-             "ref_mean": v["ref_mean"], "cur_mean": v["cur_mean"]}
+             "ref_mean": v["ref_mean"], "cur_mean": v["cur_mean"],
+             "mean_drift": v["mean_drift"],
+             "direction": "↑ increased" if v["mean_drift"] > 0 else "↓ decreased"}
             for k, v in top_drifted
         ],
+        "drift_causes": drift_causes,
         "outcome_distribution": current_outcomes,
         "score_distribution": {
             "reference": score_drift.get("reference_distribution", {}),
@@ -240,7 +253,8 @@ def compute_and_store_drift_report(
                 drift_detected: $drift_detected,
                 top_drifted_json: $top_drifted_json,
                 outcome_distribution_json: $outcome_distribution_json,
-                score_distribution_json: $score_distribution_json
+                score_distribution_json: $score_distribution_json,
+                drift_causes_json: $drift_causes_json
             }
         """,
             id=report["id"],
@@ -257,9 +271,166 @@ def compute_and_store_drift_report(
             top_drifted_json=json.dumps(report["top_drifted_features"]),
             outcome_distribution_json=json.dumps(report["outcome_distribution"]),
             score_distribution_json=json.dumps(report["score_distribution"]),
+            drift_causes_json=json.dumps(report["drift_causes"]),
         )
 
     return report
+
+
+# ── Human-readable drift cause explanation ────────────────────────────────────
+
+_FEATURE_DESCRIPTIONS: dict[str, str] = {
+    "is_cross_border":        "cross-border transactions",
+    "is_wire":                "wire transfers",
+    "is_crypto":              "cryptocurrency transactions",
+    "is_cash":                "cash transactions",
+    "is_high_amount":         "high-value transactions (>$10k)",
+    "is_very_high_amount":    "very high-value transactions (>$50k)",
+    "in_structuring_band":    "structuring-band amounts ($9k–$10k)",
+    "is_round_amount":        "round-number amounts",
+    "is_night_transaction":   "after-hours transactions",
+    "is_weekend":             "weekend transactions",
+    "is_new_sender_account":  "new sender accounts (<30d)",
+    "is_dormant_sender":      "dormant accounts suddenly active",
+    "sender_is_pep":          "politically exposed person (PEP) senders",
+    "sender_is_sanctioned":   "sanctioned senders",
+    "ip_is_tor":              "Tor network originating IPs",
+    "ip_is_vpn":              "VPN originating IPs",
+    "ip_country_mismatch":    "IP / account country mismatches",
+    "is_high_velocity_1h":    "high-velocity activity (1h window)",
+    "is_high_velocity_24h":   "high-velocity activity (24h window)",
+    "is_structuring":         "structured transaction patterns",
+    "is_round_trip":          "round-trip fund movements",
+    "device_shared":          "shared device usage",
+    "is_deep_layering":       "deep layering (3+ hops)",
+    "receiver_country_risk":  "high-risk receiver jurisdictions",
+    "beneficiary_country_risk": "high-risk beneficiary jurisdictions",
+    "sender_to_high_risk":    "transfers to high-risk corridors",
+    "sender_to_tax_haven":    "transfers to tax havens",
+}
+
+
+def _explain_drift_causes(
+    score_drift: dict,
+    feature_drift: dict,
+    current_outcomes: dict,
+    reference_scores: list[int],
+    current_scores: list[int],
+    top_drifted: list[tuple],
+) -> list[dict]:
+    """
+    Produce a list of plain-English drift cause explanations with severity,
+    category, and recommended action.
+    """
+    causes: list[dict] = []
+
+    # ── Score distribution shift ───────────────────────────────────────────────
+    if score_drift["psi"] >= PSI_WARNING_THRESHOLD and current_scores and reference_scores:
+        ref_avg = float(np.mean(reference_scores))
+        cur_avg = float(np.mean(current_scores))
+        delta   = cur_avg - ref_avg
+        direction = "higher" if delta > 0 else "lower"
+        causes.append({
+            "category": "Score Distribution",
+            "severity": score_drift["alert_level"],
+            "psi": score_drift["psi"],
+            "title": f"Risk score distribution has shifted {direction}",
+            "detail": (
+                f"The average risk score has moved from {ref_avg:.0f} "
+                f"to {cur_avg:.0f} ({delta:+.0f} pts). "
+                f"PSI = {score_drift['psi']:.4f} — "
+                + ("significant change, model retraining recommended."
+                   if score_drift["psi"] >= PSI_CRITICAL_THRESHOLD
+                   else "moderate change, monitor closely.")
+            ),
+            "recommendation": (
+                "Retrain the model with recent data to recalibrate scores."
+                if score_drift["psi"] >= PSI_CRITICAL_THRESHOLD
+                else "Continue monitoring — run drift checks more frequently."
+            ),
+        })
+
+    # ── Feature-level drift ────────────────────────────────────────────────────
+    for fname, fdata in top_drifted:
+        if fdata["psi"] < PSI_WARNING_THRESHOLD:
+            break
+        desc = _FEATURE_DESCRIPTIONS.get(fname, fname.replace("_", " "))
+        direction = "increased" if fdata["mean_drift"] > 0 else "decreased"
+        pct_change = (
+            abs(fdata["mean_drift"]) / max(abs(fdata["ref_mean"]), 1e-9) * 100
+        )
+        causes.append({
+            "category": "Feature Drift",
+            "severity": fdata["alert_level"],
+            "psi": fdata["psi"],
+            "feature": fname,
+            "title": f"Feature '{desc}' has {direction} significantly",
+            "detail": (
+                f"Proportion of {desc} changed from {fdata['ref_mean']:.3f} "
+                f"(training) to {fdata['cur_mean']:.3f} (current) — "
+                f"a {pct_change:.0f}% shift. PSI = {fdata['psi']:.4f}."
+            ),
+            "recommendation": (
+                f"Investigate why {desc} have {'increased' if fdata['mean_drift'] > 0 else 'decreased'}. "
+                "This may indicate a change in transaction mix or emerging fraud typology."
+            ),
+        })
+
+    # ── Outcome distribution shift ─────────────────────────────────────────────
+    total_current = sum(current_outcomes.values()) or 1
+    decline_pct = current_outcomes.get("DECLINE", 0) / total_current * 100
+    if decline_pct > 20:
+        causes.append({
+            "category": "Outcome Shift",
+            "severity": "WARNING" if decline_pct < 35 else "CRITICAL",
+            "psi": None,
+            "title": f"Decline rate elevated at {decline_pct:.0f}%",
+            "detail": (
+                f"In the current evaluation window, {decline_pct:.0f}% of transactions "
+                f"were DECLINED ({current_outcomes.get('DECLINE', 0)} out of {sum(current_outcomes.values())}). "
+                "This is above the expected threshold."
+            ),
+            "recommendation": (
+                "Review recent DECLINE decisions for false positives. "
+                "Consider adjusting risk thresholds or investigating for fraud wave."
+            ),
+        })
+    elif current_outcomes.get("DECLINE", 0) == 0 and sum(current_outcomes.values()) > 10:
+        causes.append({
+            "category": "Outcome Shift",
+            "severity": "WARNING",
+            "psi": None,
+            "title": "No transactions declined — model may be under-scoring",
+            "detail": "Zero DECLINE outcomes in the current window with an active evaluation set is unusual.",
+            "recommendation": "Verify that the risk engine is correctly calibrated and evaluating recent transactions.",
+        })
+
+    # ── No drift detected ──────────────────────────────────────────────────────
+    if not causes:
+        if not current_scores:
+            causes.append({
+                "category": "Data Coverage",
+                "severity": "WARNING",
+                "psi": None,
+                "title": "No recent predictions to evaluate",
+                "detail": "There are no prediction logs in the evaluation window. Drift cannot be computed accurately.",
+                "recommendation": "Submit transactions through the risk engine to generate prediction logs.",
+            })
+        else:
+            causes.append({
+                "category": "Status",
+                "severity": "OK",
+                "psi": score_drift["psi"],
+                "title": "No significant drift detected",
+                "detail": (
+                    f"All PSI values are below the warning threshold ({PSI_WARNING_THRESHOLD}). "
+                    f"Score PSI = {score_drift['psi']:.4f}. "
+                    "The model is performing consistently with its training distribution."
+                ),
+                "recommendation": "Continue periodic drift checks every 7 days.",
+            })
+
+    return causes
 
 
 def get_drift_history(limit: int = 20) -> list[dict]:
@@ -272,7 +443,12 @@ def get_drift_history(limit: int = 20) -> list[dict]:
     results = []
     for r in records:
         d = dict(r["dr"])
-        for key in ("top_drifted_json", "outcome_distribution_json", "score_distribution_json"):
+        for key in (
+            "top_drifted_json",
+            "outcome_distribution_json",
+            "score_distribution_json",
+            "drift_causes_json",
+        ):
             if key in d:
                 try:
                     d[key.replace("_json", "")] = json.loads(d.pop(key))
