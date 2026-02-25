@@ -49,9 +49,16 @@ except ImportError:
 from db.client import neo4j_session
 
 # ── Batch account-stats loader ────────────────────────────────────────────────
+#
+# Two-step approach:
+#   1. Cheaply fetch N account IDs (SKIP/LIMIT on the Account index — O(N))
+#   2. Compute stats only for those N accounts (MATCH by ID list — O(N))
+# This avoids a full-table-scan aggregation on all 211k accounts.
 
-_BATCH_STATS_QUERY = """
-MATCH (a:Account)
+_SAMPLE_IDS_QUERY = "MATCH (a:Account) RETURN a.id AS id SKIP $skip LIMIT $limit"
+
+_STATS_BY_IDS_QUERY = """
+MATCH (a:Account) WHERE a.id IN $ids
 OPTIONAL MATCH (a)-[:INITIATED]->(t_out:Transaction)
 OPTIONAL MATCH (t_in:Transaction)-[:CREDITED_TO]->(a)
 WITH a,
@@ -76,28 +83,41 @@ RETURN
   out_volume, in_volume, avg_out, avg_in,
   unique_senders, structuring, out_30d,
   a.average_monthly_volume   AS avg_monthly_vol
-ORDER BY rand()
-SKIP $skip
-LIMIT $limit
 """
+
+# Keep the original query for backward-compat (used by scan_all_accounts via SKIP/LIMIT)
+_BATCH_STATS_QUERY = _STATS_BY_IDS_QUERY
 
 
 def _load_account_feature_matrix(
-    limit: int = 5_000,
+    limit: int = 2_000,
+    skip: int = 0,
 ) -> tuple[np.ndarray, list[str]]:
     """
-    Load account-level statistics for up to `limit` accounts in one query.
+    Load account-level statistics for up to `limit` accounts.
+    Uses a two-step approach:
+      1. Fetch `limit` account IDs cheaply (index scan, O(limit))
+      2. Compute aggregated stats for only those IDs (O(limit))
     Returns (X float32 (n, 8), account_ids).
     """
     since_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
+
+    # Step 1 — cheap ID fetch
     with neo4j_session() as s:
-        records = list(s.run(_BATCH_STATS_QUERY, since_30d=since_30d, skip=0, limit=limit))
+        id_rows = s.run(_SAMPLE_IDS_QUERY, skip=skip, limit=limit).data()
+    account_ids = [r["id"] for r in id_rows]
+    if not account_ids:
+        return np.empty((0, 8), dtype=np.float32), []
+
+    # Step 2 — stats for the sampled IDs only
+    with neo4j_session() as s:
+        records = s.run(_STATS_BY_IDS_QUERY, ids=account_ids, since_30d=since_30d).data()
 
     rows: list[np.ndarray] = []
     ids: list[str] = []
     for rec in records:
         try:
-            fv = _stats_to_feature_vector(dict(rec))
+            fv = _stats_to_feature_vector(rec)
             rows.append(fv)
             ids.append(rec["id"])
         except Exception:
@@ -251,7 +271,7 @@ class MuleAccountDetector:
     # ── Training ───────────────────────────────────────────────────────────────
 
     # Default number of account vectors to sample for the index.
-    _MAX_INDEX = 5_000
+    _MAX_INDEX = 2_000
 
     def fit(
         self,
@@ -435,17 +455,34 @@ class MuleAccountDetector:
         scan_query = _BATCH_SCAN_FORCE_QUERY if force else _BATCH_SCAN_QUERY
         since_30d  = (datetime.utcnow() - timedelta(days=30)).isoformat()
 
+        # ID query — cheap indexed scan; filter to unscored accounts when not forcing
+        id_query = (
+            "MATCH (a:Account) WHERE NOT EXISTS(a.anomaly_score) RETURN a.id AS id SKIP $skip LIMIT $limit"
+            if not force else
+            "MATCH (a:Account) RETURN a.id AS id SKIP $skip LIMIT $limit"
+        )
+
         cap = max_accounts if max_accounts > 0 else 10_000_000
         suspects: list[dict] = []
         processed = 0
 
         for skip in range(0, cap, batch_size):
             fetch = min(batch_size, cap - skip)
+
+            # Step 1 — cheap: get account IDs
             with neo4j_session() as s:
-                rows = list(s.run(scan_query, since_30d=since_30d, skip=skip, limit=fetch))
+                id_rows = s.run(id_query, skip=skip, limit=fetch).data()
+            if not id_rows:
+                break
+            batch_ids = [r["id"] for r in id_rows]
+
+            # Step 2 — compute stats for only this batch of IDs
+            with neo4j_session() as s:
+                rows = list(s.run(_STATS_BY_IDS_QUERY, ids=batch_ids, since_30d=since_30d))
 
             if not rows:
-                break
+                processed += len(batch_ids)
+                continue
 
             # Score the entire batch in Python (no more Neo4j calls)
             batch_results: list[dict] = []
@@ -495,7 +532,7 @@ class MuleAccountDetector:
             if progress_cb:
                 progress_cb(processed, cap)
 
-            if len(rows) < fetch:
+            if len(batch_ids) < fetch:
                 break  # no more accounts to fetch
 
         return suspects

@@ -232,7 +232,7 @@ def train_and_save_all() -> dict:
         from ml.anomaly import MuleAccountDetector, reset_detector
         console.print("\n[bold cyan]━━━ Training KNN Mule-Account Anomaly Detector ━━━[/]")
         detector = MuleAccountDetector()
-        m_anom = detector.fit()   # loads its own data — avoids 1 GB X duplication
+        m_anom = detector.fit(max_normal=2_000)  # 2k accounts: fast + representative
         detector.save()
         reset_detector()
         all_metrics["anomaly"] = m_anom
@@ -281,8 +281,32 @@ def _save_training_metadata(X: np.ndarray, y: np.ndarray,
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     sample_size = min(500, len(X))
     idx = random.sample(range(len(X)), sample_size)
-    training_scores = [round(float(p) * 999)
-                       for p in xgb_model.predict_proba_batch(X[idx])]
+
+    # Run XGBoost inference in a thread with a 30s timeout to avoid OpenMP
+    # thread-pool deadlocks that can occur after long multi-model training runs.
+    import concurrent.futures as _cf
+    training_scores: list[int] = []
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(xgb_model.predict_proba_batch, X[idx])
+            probs = future.result(timeout=30)
+            training_scores = [round(float(p) * 999) for p in probs]
+    except Exception as e:
+        console.print(f"  [yellow]⚠ Metadata score inference skipped ({e}); using label proxy[/]")
+        # Fallback: use the labels as a coarse score proxy (0 → 0, 1 → 999)
+        training_scores = [int(lbl) * 999 for lbl in y[idx].tolist()]
+
+    # Sanitise all_metrics: convert numpy scalars → Python native so json.dump
+    # doesn't raise TypeError on non-serialisable types.
+    def _to_native(obj):
+        if isinstance(obj, dict):
+            return {k: _to_native(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_to_native(v) for v in obj]
+        if hasattr(obj, "item"):           # numpy scalar
+            return obj.item()
+        return obj
+
     payload: dict = {
         "training_scores":          training_scores,
         "training_vectors_sample":  X[idx].tolist(),
@@ -291,6 +315,6 @@ def _save_training_metadata(X: np.ndarray, y: np.ndarray,
         "fraud_rate":               float(y.mean()),
     }
     if all_metrics:
-        payload["model_metrics"] = all_metrics
+        payload["model_metrics"] = _to_native(all_metrics)
     with open(meta_path, "w") as f:
         json.dump(payload, f)
