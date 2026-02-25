@@ -565,3 +565,73 @@ export const getGraphSAGEComparison = (limit = 200) =>
 
 export const trainGraphSAGE = (params?: { max_nodes?: number; max_edges?: number; epochs?: number }) =>
   api.post('/graphsage/train', null, { params }).then(r => r.data)
+
+// ── Model Versioning ────────────────────────────────────────────────────────
+
+export interface ModelVersionMeta {
+  version_id: string
+  status: 'baseline' | 'experimental' | 'retired'
+  trained_at: string
+  n_samples: number
+  fraud_rate: number
+  last_txn_timestamp: string
+  training_type: 'full' | 'incremental'
+  trigger: string
+  metrics: {
+    xgb?: { roc_auc?: number; avg_precision?: number; best_threshold?: number }
+    svm?: { roc_auc?: number; avg_precision?: number }
+    knn_anomaly?: Record<string, unknown>
+    graphsage?: { roc_auc?: number; avg_precision?: number }
+  }
+  xgb_auc: number
+  svm_auc: number
+  promotion_reason: string
+  notes: string
+}
+
+export interface VersionsResponse {
+  versions: ModelVersionMeta[]
+  baseline_id: string | null
+  experimental_id: string | null
+  total: number
+}
+
+export interface CurrentVersionsResponse {
+  baseline: ModelVersionMeta | null
+  experimental: ModelVersionMeta | null
+  comparison: {
+    xgb_auc_delta: number
+    would_auto_promote: boolean
+    promotion_threshold: number
+  } | null
+}
+
+export interface TrainingStatusResponse {
+  running: boolean
+  started_at: string | null
+  finished_at: string | null
+  result: Record<string, unknown> | null
+  error: string | null
+}
+
+export const listModelVersions = () =>
+  api.get<VersionsResponse>('/models/versions').then(r => r.data)
+
+export const getCurrentVersions = () =>
+  api.get<CurrentVersionsResponse>('/models/versions/current').then(r => r.data)
+
+export const getTrainingStatus = () =>
+  api.get<TrainingStatusResponse>('/models/train/status').then(r => r.data)
+
+export const triggerIncrementalTrain = (force = false, autoPromote = true) =>
+  api.post('/models/train/incremental', { trigger: 'manual', force, auto_promote: autoPromote })
+    .then(r => r.data)
+
+export const promoteVersion = (versionId: string, reason = 'Manually promoted') =>
+  api.post(`/models/versions/${versionId}/promote`, { reason }).then(r => r.data)
+
+export const retireVersion = (versionId: string) =>
+  api.post(`/models/versions/${versionId}/retire`).then(r => r.data)
+
+export const compareVersion = (versionId: string) =>
+  api.get(`/models/versions/${versionId}/compare`).then(r => r.data)

@@ -1,16 +1,20 @@
 import React, { useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip,
   CartesianGrid, ResponsiveContainer, Legend, PieChart, Pie, Cell,
 } from 'recharts'
 import {
   Activity, AlertTriangle, CheckCircle, XCircle,
-  RefreshCw, TrendingUp, Clock,
+  RefreshCw, TrendingUp, Clock, GitBranch, Zap, ArrowUpCircle, Archive,
 } from 'lucide-react'
 import {
   getMonitoringSummary, getOutcomeTrend, getScoreDistribution,
   getTopRiskFactors, computeDrift, getDriftHistory,
+  listModelVersions, getCurrentVersions, getTrainingStatus,
+  triggerIncrementalTrain, promoteVersion, retireVersion,
+  type ModelVersionMeta,
+  type VersionsResponse, type CurrentVersionsResponse, type TrainingStatusResponse,
 } from '../api/client'
 import clsx from 'clsx'
 
@@ -35,11 +39,24 @@ function StatCard({ title, value, sub, icon: Icon, color = 'text-white' }: {
 }
 
 export default function ModelMonitor() {
+  const qc = useQueryClient()
   const summary = useQuery({ queryKey: ['monitoring-summary'], queryFn: getMonitoringSummary, refetchInterval: 30_000 })
   const trend = useQuery({ queryKey: ['outcome-trend'], queryFn: () => getOutcomeTrend(14) })
   const scoreDist = useQuery({ queryKey: ['score-dist'], queryFn: () => getScoreDistribution(7) })
   const riskFactors = useQuery({ queryKey: ['risk-factors'], queryFn: () => getTopRiskFactors(7) })
   const driftHistory = useQuery({ queryKey: ['drift-history'], queryFn: getDriftHistory })
+
+  // Model versioning
+  const versionsQ  = useQuery({ queryKey: ['model-versions'], queryFn: listModelVersions })
+  const currentQ   = useQuery({ queryKey: ['model-versions-current'], queryFn: getCurrentVersions })
+  const trainJobQ  = useQuery({
+    queryKey: ['train-status'],
+    queryFn: getTrainingStatus,
+    refetchInterval: (data: unknown) => {
+      const d = data as { running?: boolean } | undefined
+      return d?.running ? 3000 : false
+    },
+  })
 
   const driftMutation = useMutation({
     mutationFn: computeDrift,
@@ -47,6 +64,27 @@ export default function ModelMonitor() {
       driftHistory.refetch()
       summary.refetch()
     },
+  })
+
+  const trainMutation = useMutation({
+    mutationFn: ({ force, autoPromote }: { force: boolean; autoPromote: boolean }) =>
+      triggerIncrementalTrain(force, autoPromote),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['train-status'] })
+    },
+  })
+
+  const promoteMutation = useMutation({
+    mutationFn: (versionId: string) => promoteVersion(versionId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['model-versions'] })
+      qc.invalidateQueries({ queryKey: ['model-versions-current'] })
+    },
+  })
+
+  const retireMutation = useMutation({
+    mutationFn: (versionId: string) => retireVersion(versionId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['model-versions'] }),
   })
 
   const s = summary.data
@@ -240,6 +278,18 @@ export default function ModelMonitor() {
         </div>
       </div>
 
+      {/* ── Model Versioning ────────────────────────────────────────────── */}
+      <ModelVersioningPanel
+        versionsData={versionsQ.data}
+        currentData={currentQ.data}
+        trainJob={trainJobQ.data}
+        onTrain={(force, autoPromote) => trainMutation.mutate({ force, autoPromote })}
+        onPromote={(vid) => promoteMutation.mutate(vid)}
+        onRetire={(vid) => retireMutation.mutate(vid)}
+        trainPending={trainMutation.isPending}
+        promotePending={promoteMutation.isPending}
+      />
+
       {/* Drift history */}
       {driftHistory.data?.reports?.length > 0 && (
         <div className="space-y-4">
@@ -252,6 +302,324 @@ export default function ModelMonitor() {
             )
           })}
         </div>
+      )}
+    </div>
+  )
+}
+
+// ── Model Versioning Panel ────────────────────────────────────────────────────
+
+const STATUS_COLORS: Record<string, string> = {
+  baseline:     'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+  experimental: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+  retired:      'bg-slate-700/40 text-slate-500 border-slate-700',
+}
+
+const STATUS_ICONS: Record<string, React.ElementType> = {
+  baseline:     CheckCircle,
+  experimental: Zap,
+  retired:      Archive,
+}
+
+function VersionBadge({ status }: { status: string }) {
+  const Icon = STATUS_ICONS[status] ?? Activity
+  return (
+    <span className={clsx('inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border', STATUS_COLORS[status] ?? STATUS_COLORS.retired)}>
+      <Icon size={10} />
+      {status}
+    </span>
+  )
+}
+
+function AucBar({ label, value, baseline }: { label: string; value: number; baseline?: number }) {
+  const pct = Math.min(value * 100, 100)
+  const delta = baseline !== undefined ? value - baseline : null
+  return (
+    <div>
+      <div className="flex justify-between text-xs mb-0.5">
+        <span className="text-slate-400">{label}</span>
+        <span className="text-white font-mono">
+          {value.toFixed(4)}
+          {delta !== null && (
+            <span className={clsx('ml-1', delta >= 0 ? 'text-emerald-400' : 'text-red-400')}>
+              ({delta >= 0 ? '+' : ''}{delta.toFixed(4)})
+            </span>
+          )}
+        </span>
+      </div>
+      <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+        <div
+          className={clsx('h-full rounded-full', delta !== null && delta < 0 ? 'bg-amber-500' : 'bg-blue-500')}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
+function VersionCard({
+  version, isBaseline, baselineAuc, onPromote, onRetire, promotePending,
+}: {
+  version: ModelVersionMeta
+  isBaseline: boolean
+  baselineAuc?: number
+  onPromote: () => void
+  onRetire: () => void
+  promotePending: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const ts = new Date(version.trained_at).toLocaleString()
+  const checkpoint = version.last_txn_timestamp
+    ? new Date(version.last_txn_timestamp).toLocaleDateString()
+    : '—'
+
+  return (
+    <div className={clsx('rounded-xl border p-4', isBaseline ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-slate-800 bg-slate-900')}>
+      {/* Header */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-bold text-white font-mono">{version.version_id}</span>
+          <VersionBadge status={version.status} />
+          <span className={clsx('text-xs px-1.5 py-0.5 rounded border',
+            version.training_type === 'incremental'
+              ? 'bg-purple-500/10 text-purple-300 border-purple-500/30'
+              : 'bg-slate-700/40 text-slate-400 border-slate-700')}>
+            {version.training_type}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {version.status === 'experimental' && !promotePending && (
+            <button
+              onClick={onPromote}
+              className="flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors"
+            >
+              <ArrowUpCircle size={12} />
+              Promote
+            </button>
+          )}
+          {version.status !== 'baseline' && version.status !== 'retired' && (
+            <button
+              onClick={onRetire}
+              className="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs font-medium rounded-lg transition-colors"
+            >
+              Retire
+            </button>
+          )}
+          <button
+            onClick={() => setExpanded(e => !e)}
+            className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+          >
+            {expanded ? '▲ Less' : '▼ More'}
+          </button>
+        </div>
+      </div>
+
+      {/* Metrics row */}
+      <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+        <div>
+          <p className="text-slate-500 mb-0.5">XGB ROC-AUC</p>
+          <p className={clsx('font-bold tabular-nums',
+            !isBaseline && baselineAuc !== undefined
+              ? version.xgb_auc >= baselineAuc ? 'text-emerald-400' : 'text-amber-400'
+              : 'text-white')}>
+            {version.xgb_auc ? version.xgb_auc.toFixed(4) : '—'}
+          </p>
+        </div>
+        <div>
+          <p className="text-slate-500 mb-0.5">Samples</p>
+          <p className="text-white font-medium">{version.n_samples.toLocaleString()}</p>
+        </div>
+        <div>
+          <p className="text-slate-500 mb-0.5">Trained</p>
+          <p className="text-slate-300">{ts}</p>
+        </div>
+        <div>
+          <p className="text-slate-500 mb-0.5">Checkpoint</p>
+          <p className="text-slate-300">{checkpoint}</p>
+        </div>
+      </div>
+
+      {/* Expanded: AUC bars + notes */}
+      {expanded && (
+        <div className="mt-4 space-y-3 pt-3 border-t border-slate-800">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <AucBar label="XGBoost ROC-AUC" value={version.xgb_auc} baseline={isBaseline ? undefined : baselineAuc} />
+            {version.svm_auc > 0 && (
+              <AucBar label="SVM ROC-AUC" value={version.svm_auc} />
+            )}
+          </div>
+          {version.metrics?.graphsage?.roc_auc && (
+            <AucBar label="GraphSAGE ROC-AUC" value={Number(version.metrics.graphsage.roc_auc)} />
+          )}
+          {version.notes && (
+            <p className="text-xs text-slate-400 italic">{version.notes}</p>
+          )}
+          {version.promotion_reason && (
+            <p className="text-xs text-emerald-400">↑ {version.promotion_reason}</p>
+          )}
+          {version.trigger && (
+            <p className="text-xs text-slate-500">Trigger: {version.trigger} · Fraud rate: {(version.fraud_rate * 100).toFixed(1)}%</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ModelVersioningPanel({
+  versionsData, currentData, trainJob,
+  onTrain, onPromote, onRetire,
+  trainPending, promotePending,
+}: {
+  versionsData: VersionsResponse | undefined
+  currentData: CurrentVersionsResponse | undefined
+  trainJob: TrainingStatusResponse | undefined
+  onTrain: (force: boolean, autoPromote: boolean) => void
+  onPromote: (vid: string) => void
+  onRetire: (vid: string) => void
+  trainPending: boolean
+  promotePending: boolean
+}) {
+  const [showAll, setShowAll] = useState(false)
+  const versions = versionsData?.versions ?? []
+  const baseline = currentData?.baseline
+  const experimental = currentData?.experimental
+  const comparison = currentData?.comparison
+  const baselineAuc = baseline?.xgb_auc ?? 0
+  const visibleVersions = showAll ? versions : versions.slice(0, 5)
+
+  const jobRunning = trainJob?.running
+  const jobResult = trainJob?.result as Record<string, unknown> | null
+
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 p-5 space-y-5">
+      {/* Section header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <GitBranch size={16} className="text-blue-400" />
+          <h3 className="text-sm font-semibold text-white">Model Versions</h3>
+          {versions.length > 0 && (
+            <span className="text-xs text-slate-500">{versions.length} version{versions.length !== 1 ? 's' : ''}</span>
+          )}
+        </div>
+        <button
+          onClick={() => onTrain(false, true)}
+          disabled={trainPending || jobRunning}
+          className="flex items-center gap-2 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:bg-slate-700 text-white text-xs font-medium rounded-lg transition-colors"
+        >
+          <Zap size={12} className={jobRunning ? 'animate-pulse' : ''} />
+          {jobRunning ? 'Training…' : 'Incremental Train'}
+        </button>
+      </div>
+
+      {/* Training job status banner */}
+      {trainJob && (trainJob.running || trainJob.result || trainJob.error) && (
+        <div className={clsx('rounded-lg border p-3 text-xs',
+          trainJob.running
+            ? 'bg-purple-500/10 border-purple-500/30 text-purple-300'
+            : trainJob.error
+              ? 'bg-red-500/10 border-red-500/30 text-red-300'
+              : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300')}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {trainJob.running
+                ? <RefreshCw size={12} className="animate-spin" />
+                : trainJob.error
+                  ? <XCircle size={12} />
+                  : <CheckCircle size={12} />}
+              <span className="font-medium">
+                {trainJob.running
+                  ? `Training in progress… (started ${trainJob.started_at ? new Date(trainJob.started_at).toLocaleTimeString() : ''})`
+                  : trainJob.error
+                    ? `Training failed: ${trainJob.error}`
+                    : `Training complete — ${(jobResult?.version_id as string) ?? ''} ${(jobResult?.promoted as boolean) ? 'auto-promoted ✓' : 'is experimental'}`}
+              </span>
+            </div>
+            {jobResult && (
+              <span className="font-mono text-white">
+                AUC {typeof jobResult.xgb_auc === 'number' ? (jobResult.xgb_auc as number).toFixed(4) : '—'}
+                {typeof jobResult.improvement === 'number' && (
+                  <span className={clsx('ml-1', (jobResult.improvement as number) >= 0 ? 'text-emerald-400' : 'text-amber-400')}>
+                    ({(jobResult.improvement as number) >= 0 ? '+' : ''}{(jobResult.improvement as number).toFixed(4)})
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Baseline vs Experimental comparison */}
+      {baseline && experimental && comparison && (
+        <div className="grid grid-cols-2 gap-4 p-3 rounded-lg bg-slate-800/40 border border-slate-700">
+          <div>
+            <p className="text-xs font-semibold text-slate-400 mb-1">Baseline ({baseline.version_id})</p>
+            <p className="text-lg font-bold text-white tabular-nums">{baseline.xgb_auc.toFixed(4)}</p>
+            <p className="text-xs text-slate-500">{baseline.n_samples.toLocaleString()} samples · {baseline.training_type}</p>
+          </div>
+          <div>
+            <p className="text-xs font-semibold text-slate-400 mb-1">Experimental ({experimental.version_id})</p>
+            <p className={clsx('text-lg font-bold tabular-nums',
+              comparison.xgb_auc_delta >= 0 ? 'text-emerald-400' : 'text-amber-400')}>
+              {experimental.xgb_auc.toFixed(4)}
+              <span className="text-sm ml-1">
+                ({comparison.xgb_auc_delta >= 0 ? '+' : ''}{comparison.xgb_auc_delta.toFixed(4)})
+              </span>
+            </p>
+            <p className="text-xs text-slate-500">{experimental.n_samples.toLocaleString()} samples · {experimental.training_type}</p>
+          </div>
+          <div className="col-span-2 pt-2 border-t border-slate-700">
+            <div className="flex items-center justify-between">
+              <span className={clsx('text-xs font-medium',
+                comparison.would_auto_promote ? 'text-emerald-400' : 'text-amber-400')}>
+                {comparison.would_auto_promote
+                  ? '✓ Meets auto-promotion criteria'
+                  : `⚠ Below promotion threshold (need ≥ baseline × ${comparison.promotion_threshold})`}
+              </span>
+              <button
+                onClick={() => onPromote(experimental.version_id)}
+                disabled={promotePending}
+                className="flex items-center gap-1 px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 text-white text-xs font-medium rounded-lg transition-colors"
+              >
+                <ArrowUpCircle size={12} />
+                Promote {experimental.version_id}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* No versions yet */}
+      {versions.length === 0 && (
+        <div className="text-center py-8 text-slate-500 text-sm">
+          <GitBranch size={24} className="mx-auto mb-2 text-slate-700" />
+          <p>No model versions yet.</p>
+          <p className="text-xs mt-1">Run a full retrain to create the baseline (v1), then use "Incremental Train" for subsequent updates.</p>
+        </div>
+      )}
+
+      {/* Version list */}
+      <div className="space-y-3">
+        {visibleVersions.map(v => (
+          <VersionCard
+            key={v.version_id}
+            version={v}
+            isBaseline={v.version_id === versionsData?.baseline_id}
+            baselineAuc={baselineAuc}
+            onPromote={() => onPromote(v.version_id)}
+            onRetire={() => onRetire(v.version_id)}
+            promotePending={promotePending}
+          />
+        ))}
+      </div>
+
+      {versions.length > 5 && (
+        <button
+          onClick={() => setShowAll(s => !s)}
+          className="w-full text-xs text-slate-500 hover:text-slate-300 py-1 transition-colors"
+        >
+          {showAll ? '▲ Show less' : `▼ Show all ${versions.length} versions`}
+        </button>
       )}
     </div>
   )
@@ -311,7 +679,7 @@ function DriftReportCard({
           <span className="text-slate-400 text-xs">
             {String(report.computed_at).slice(0, 16).replace('T', ' ')}
           </span>
-          {report.drift_detected && (
+          {Boolean(report.drift_detected) && (
             <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full border border-red-500/30">
               Drift Detected
             </span>
@@ -320,8 +688,8 @@ function DriftReportCard({
         <div className="flex items-center gap-4 text-xs text-slate-400">
           <span>Score PSI: <span className="text-white">{Number(report.score_distribution_psi).toFixed(3)}</span></span>
           <span>Max Feature PSI: <span className="text-white">{Number(report.max_feature_psi).toFixed(3)}</span></span>
-          <span className="text-amber-400">{report.features_in_warning as number} warn</span>
-          <span className="text-red-400">{report.features_in_critical as number} crit</span>
+          <span className="text-amber-400">{Number(report.features_in_warning)} warn</span>
+          <span className="text-red-400">{Number(report.features_in_critical)} crit</span>
           <button
             onClick={() => setExpanded(x => !x)}
             className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 transition-colors"

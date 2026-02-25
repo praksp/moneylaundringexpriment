@@ -267,6 +267,40 @@ def train_and_save_all() -> dict:
     _save_training_metadata(X, y, xgb, all_metrics)
     console.print("\n[bold green]✓ All models saved — metadata written[/]")
 
+    # ── Register as new baseline version ──────────────────────────────────────
+    try:
+        from ml.version import (
+            ModelVersion, get_version_registry,
+            reset_version_registry, now_iso,
+        )
+        from db.client import neo4j_session as _neo4j_session
+        # Get latest transaction timestamp as checkpoint
+        with _neo4j_session() as _s:
+            _row = _s.run("MATCH (t:Transaction) RETURN max(t.timestamp) AS ts").single()
+            _last_ts = str(_row["ts"] or "")
+        reg = get_version_registry()
+        reg.reload()
+        new_vid = reg.next_version_id()
+        version = ModelVersion(
+            version_id         = new_vid,
+            status             = "baseline",
+            trained_at         = now_iso(),
+            n_samples          = int(len(X)),
+            fraud_rate         = round(float(y.mean()), 4),
+            last_txn_timestamp = _last_ts,
+            training_type      = "full",
+            trigger            = "manual",
+            metrics            = all_metrics,
+            notes              = f"Full retrain on {len(X):,} transactions.",
+        )
+        reg.archive_current_models(new_vid)
+        reg.register_version(version)
+        reg.set_baseline(new_vid, reason="Full retrain")
+        reset_version_registry()
+        console.print(f"[bold green]✓ Version {new_vid} registered as baseline[/]")
+    except Exception as _e:
+        console.print(f"[yellow]⚠ Version registration skipped: {_e}[/]")
+
     reset_registry()
     return all_metrics
 
