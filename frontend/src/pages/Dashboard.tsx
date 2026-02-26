@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useMemo } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, Cell } from 'recharts'
 import { ShieldAlert, TrendingUp, Users, Activity } from 'lucide-react'
 import { getTransactionStats, getMonitoringSummary } from '../api/client'
@@ -12,10 +13,12 @@ export default function Dashboard() {
   const s = stats.data
   const m = monitor.data
 
-  const fraudByType = Object.entries(s?.fraud_by_type || {}).map(([type, count]) => ({
-    type: type?.replace('_', ' ') || 'UNKNOWN',
-    count,
-  }))
+  const fraudByType = useMemo(() => {
+    return Object.entries(s?.fraud_by_type || {}).map(([type, count]) => ({
+      type: type?.replace('_', ' ') || 'UNKNOWN',
+      count,
+    }))
+  }, [s?.fraud_by_type])
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8">

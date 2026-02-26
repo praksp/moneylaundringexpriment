@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import React, { useState } from 'react'
 import { useQuery, useMutation, keepPreviousData } from '@tanstack/react-query'
 import {
   Search, User, AlertTriangle, TrendingUp, TrendingDown, Minus,
@@ -921,12 +921,16 @@ export default function CustomerProfiles() {
   const [selectedTxn, setSelectedTxn] = useState<TransactionSummary | null>(null)
 
   // Debounce search so we don't hammer the API on every keypress
-  const searchTimer = useState<ReturnType<typeof setTimeout> | null>(null)
+  React.useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearch(search)
+    }, 350)
+    return () => clearTimeout(handler)
+  }, [search])
+
   const handleSearch = (val: string) => {
     setSearch(val)
     setCustPage(1)
-    if (searchTimer[0]) clearTimeout(searchTimer[0])
-    searchTimer[1](setTimeout(() => setDebouncedSearch(val), 350))
   }
 
   const handleRiskFilter = (val: string) => {

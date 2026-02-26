@@ -14,6 +14,8 @@ def get_driver() -> Driver:
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
             max_connection_pool_size=50,
+            max_connection_lifetime=300,
+            connection_acquisition_timeout=30,
         )
         _driver.verify_connectivity()
     return _driver
@@ -26,6 +28,8 @@ async def get_async_driver() -> AsyncDriver:
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
             max_connection_pool_size=50,
+            max_connection_lifetime=300,
+            connection_acquisition_timeout=30,
         )
         await _async_driver.verify_connectivity()
     return _async_driver

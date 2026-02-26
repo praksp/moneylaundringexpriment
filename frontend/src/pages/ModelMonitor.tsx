@@ -76,7 +76,31 @@ export default function ModelMonitor() {
 
   const promoteMutation = useMutation({
     mutationFn: (versionId: string) => promoteVersion(versionId),
-    onSuccess: () => {
+    onMutate: async (versionId) => {
+      await qc.cancelQueries({ queryKey: ['model-versions'] })
+      await qc.cancelQueries({ queryKey: ['model-versions-current'] })
+      const prevVersions = qc.getQueryData(['model-versions'])
+      const prevCurrent = qc.getQueryData(['model-versions-current'])
+
+      qc.setQueryData(['model-versions'], (old: any) => {
+        if (!old || !old.versions) return old
+        return {
+          ...old,
+          versions: old.versions.map((v: any) => {
+            if (v.version_id === versionId) return { ...v, status: 'baseline' }
+            if (v.status === 'baseline') return { ...v, status: 'retired' }
+            return v
+          })
+        }
+      })
+
+      return { prevVersions, prevCurrent }
+    },
+    onError: (_err, _variables, context) => {
+      if (context?.prevVersions) qc.setQueryData(['model-versions'], context.prevVersions)
+      if (context?.prevCurrent) qc.setQueryData(['model-versions-current'], context.prevCurrent)
+    },
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: ['model-versions'] })
       qc.invalidateQueries({ queryKey: ['model-versions-current'] })
     },
@@ -84,7 +108,28 @@ export default function ModelMonitor() {
 
   const retireMutation = useMutation({
     mutationFn: (versionId: string) => retireVersion(versionId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['model-versions'] }),
+    onMutate: async (versionId) => {
+      await qc.cancelQueries({ queryKey: ['model-versions'] })
+      const prevVersions = qc.getQueryData(['model-versions'])
+
+      qc.setQueryData(['model-versions'], (old: any) => {
+        if (!old || !old.versions) return old
+        return {
+          ...old,
+          versions: old.versions.map((v: any) =>
+            v.version_id === versionId ? { ...v, status: 'retired' } : v
+          )
+        }
+      })
+
+      return { prevVersions }
+    },
+    onError: (_err, _variables, context) => {
+      if (context?.prevVersions) qc.setQueryData(['model-versions'], context.prevVersions)
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['model-versions'] })
+    },
   })
 
   const s = summary.data

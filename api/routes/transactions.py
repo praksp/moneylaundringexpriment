@@ -2,8 +2,12 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
 from db.client import neo4j_session, async_neo4j_session
 from auth.dependencies import require_viewer_or_admin
+from cachetools import TTLCache
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
+
+stats_cache = TTLCache(maxsize=1, ttl=120)
+world_map_cache = TTLCache(maxsize=1, ttl=300)
 
 LIST_QUERY = """
 MATCH (sender:Account)-[:INITIATED]->(t:Transaction)
@@ -32,10 +36,8 @@ RETURN t, sender, receiver, sc AS sender_customer, rc AS receiver_customer,
 @router.get("/stats/summary")
 async def transaction_stats():
     """Aggregate statistics about the transaction dataset. Cached for 2 minutes."""
-    from api.cache import get_cached, set_cached
-    cached = get_cached("txn_stats_summary")
-    if cached is not None:
-        return cached
+    if "data" in stats_cache:
+        return stats_cache["data"]
 
     with neo4j_session() as session:
         stats = {}
@@ -64,7 +66,7 @@ async def transaction_stats():
         r5 = session.run("MATCH (n:Account) RETURN count(n) AS c").single()
         stats["total_accounts"] = r5["c"] if r5 else 0
 
-    set_cached("txn_stats_summary", stats, ttl=120)
+    stats_cache["data"] = stats
     return stats
 
 
@@ -144,10 +146,8 @@ def _build_world_map() -> dict:
     Returns ~71 rows (one per country) instead of streaming 961k rows to Python.
     Result is cached for 5 minutes.
     """
-    from api.cache import get_cached, set_cached
-    cached = get_cached("world_map")
-    if cached is not None:
-        return cached
+    if "data" in world_map_cache:
+        return world_map_cache["data"]
 
     with neo4j_session() as session:
         # Sender-country aggregation
@@ -260,7 +260,7 @@ def _build_world_map() -> dict:
             "high_risk_countries": sum(1 for r in result if r["risk_level"] in ("HIGH", "CRITICAL")),
         },
     }
-    set_cached("world_map", payload, ttl=300)   # 5-minute cache
+    world_map_cache["data"] = payload   # 5-minute cache
     return payload
 
 

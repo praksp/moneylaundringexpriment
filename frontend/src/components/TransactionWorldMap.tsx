@@ -8,7 +8,7 @@
  * Circle colour → max risk level (green / amber / orange / red)
  * Pulsing ring  → country has fraud-labelled transactions
  */
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import * as d3 from 'd3'
 import * as topojson from 'topojson-client'
@@ -38,7 +38,7 @@ interface TooltipState {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function TransactionWorldMap({ customerId }: { customerId: string }) {
+export default React.memo(function TransactionWorldMap({ customerId }: { customerId: string }) {
   const svgRef = useRef<SVGSVGElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [tooltip, setTooltip] = useState<TooltipState | null>(null)
@@ -455,4 +455,4 @@ export default function TransactionWorldMap({ customerId }: { customerId: string
       )}
     </div>
   )
-}
+})

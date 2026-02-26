@@ -81,6 +81,11 @@ section "3/4  Starting FastAPI backend (:8001)"
 
 source "$VENV/bin/activate"
 
+# Ensure Python dependencies are up-to-date (handles new packages like cachetools)
+info "Checking Python dependencies…"
+pip install -q -r "$ROOT/requirements.txt" 2>/dev/null
+ok "Dependencies verified"
+
 cd "$ROOT"
 nohup uvicorn api.main:app \
   --host 0.0.0.0 \
@@ -108,6 +113,10 @@ done
 section "4/4  Starting Vite frontend (:5174)"
 
 cd "$FRONTEND_DIR"
+info "Installing frontend dependencies…"
+npm install --silent 2>/dev/null
+ok "Frontend dependencies verified"
+
 nohup npm run dev \
   >> "$FRONTEND_LOG" 2>&1 &
 FRONTEND_PID=$!
