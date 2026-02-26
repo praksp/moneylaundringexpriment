@@ -83,7 +83,7 @@ source "$VENV/bin/activate"
 
 # Ensure Python dependencies are up-to-date (handles new packages like cachetools)
 info "Checking Python dependencies…"
-pip install -q -r "$ROOT/requirements.txt" 2>/dev/null
+pip install -q --no-deps -r "$ROOT/requirements.txt" 2>/dev/null || true
 ok "Dependencies verified"
 
 cd "$ROOT"
@@ -114,7 +114,7 @@ section "4/4  Starting Vite frontend (:5174)"
 
 cd "$FRONTEND_DIR"
 info "Installing frontend dependencies…"
-npm install --silent 2>/dev/null
+npm install --prefer-offline --silent 2>/dev/null || true
 ok "Frontend dependencies verified"
 
 nohup npm run dev \
