@@ -635,3 +635,25 @@ export const retireVersion = (versionId: string) =>
 
 export const compareVersion = (versionId: string) =>
   api.get(`/models/versions/${versionId}/compare`).then(r => r.data)
+
+// ── Bulk Upload ─────────────────────────────────────────────────────────────
+
+export interface UploadStatusResponse {
+  running: boolean
+  status: string
+  total_records: number
+  processed_records: number
+  error: string | null
+  training_result: Record<string, unknown> | null
+}
+
+export const uploadTransactionsCSV = (file: File) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  return api.post('/upload/transactions', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }).then(r => r.data)
+}
+
+export const getUploadStatus = () =>
+  api.get<UploadStatusResponse>('/upload/status').then(r => r.data)

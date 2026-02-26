@@ -372,3 +372,18 @@ Phase 7 (Develop Branch): Performance, Scalability & Docker Optimizations
   - Created `Dockerfile.frontend` (multi-stage build with Nginx API proxy).
   - Created `docker-compose.prod.yml` to orchestrate Neo4j, backend, and frontend
     as a complete production stack.
+
+================================================================================
+Phase 8: Business Rules & Bulk CSV Upload 
+================================================================================
+
+1. Business Rule Validation
+  - Updated `api/routes/submit.py` to validate sender account balances before processing single transactions.
+  - Returns user-friendly 400 Bad Request if the transaction amount exceeds available balance.
+
+2. Bulk CSV Transaction Upload & Training
+  - Created new backend route `api/routes/upload.py` to handle large CSV uploads.
+  - Ingestion runs asynchronously via `BackgroundTasks` with automatic chunking (5,000 rows/batch) using Cypher `UNWIND`.
+  - Automatically triggers incremental model training upon successful ingestion.
+  - Created frontend "Bulk Upload" tab on the Submit Transaction page to monitor real-time background processing.
+  - Added sample CSV generator script `scripts/generate_sample_csv.py` to easily create structurally valid datasets from existing Neo4j accounts.

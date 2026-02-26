@@ -28,6 +28,7 @@ from api.routes.auth import router as auth_router
 from api.routes.anomaly import router as anomaly_router
 from api.routes.graphsage import router as graphsage_router
 from api.routes.models import router as models_router
+from api.routes.upload import router as upload_router
 from db.client import get_driver, close_driver, get_async_driver, close_async_driver
 from ml.model import get_model, get_registry
 from ml.anomaly import get_detector
@@ -114,6 +115,7 @@ app.include_router(monitoring_router)
 app.include_router(anomaly_router)
 app.include_router(graphsage_router)
 app.include_router(models_router)
+app.include_router(upload_router)
 
 
 @app.get("/health", tags=["System"])

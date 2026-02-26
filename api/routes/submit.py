@@ -48,9 +48,9 @@ async def submit_transaction(req: SubmitTransactionRequest):
     timestamp = datetime.utcnow().isoformat()
 
     with neo4j_session() as session:
-        # Verify sender account exists
+        # Verify sender account exists and check balance
         sender_check = session.run(
-            "MATCH (a:Account {id: $id}) RETURN a.id AS id",
+            "MATCH (a:Account {id: $id}) RETURN a.id AS id, a.balance AS balance, a.currency AS currency",
             id=req.sender_account_id
         ).single()
         if sender_check is None:
@@ -58,6 +58,16 @@ async def submit_transaction(req: SubmitTransactionRequest):
                 status_code=404,
                 detail=f"Sender account {req.sender_account_id} not found. "
                        "Use GET /transactions/ to browse existing accounts."
+            )
+        
+        balance = sender_check["balance"] or 0.0
+        currency = sender_check["currency"] or "USD"
+        
+        # Business Rule: Ensure sufficient balance
+        if req.amount > balance:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient funds. Transfer amount ({req.amount:,.2f} {req.currency}) exceeds available balance ({balance:,.2f} {currency}) for account {req.sender_account_id}."
             )
 
         # Store transaction node

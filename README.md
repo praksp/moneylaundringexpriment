@@ -441,6 +441,7 @@ POST /evaluate/{txn_id}             → evaluate stored transaction
 POST /evaluate/inline/evaluate      → evaluate inline (pre-storage)
 POST /evaluate/batch/evaluate       → batch evaluation
 POST /submit/transaction            → submit + evaluate new transaction
+POST /upload/transactions           → bulk CSV upload + model retraining
 ```
 
 ### Customer Profiles  *(admin only)*
